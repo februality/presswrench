@@ -1,0 +1,29 @@
+# Go
+/presswrench
+/presswrench.exe
+/dist/
+/vendor/
+*.test
+*.prof
+*.pprof
+coverage.out
+coverage.html
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Local env
+.env
+.env.local
+
+# Project-local Claude Code MCP config (often contains creds)
+.mcp.json
+
+# Defensive: file-fallback creds shape used by internal/creds/filestore.go
+credentials.json

@@ -1,0 +1,28 @@
+version: "2"
+
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # Failures from these calls aren't actionable in this codebase:
+      #   - fmt.Fprint*: terminal/log output to a TTY
+      #   - Close():    network/file resources, deferred fire-and-forget
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (io.Closer).Close
+        - (*net/http.Response).Body.Close
+        - (*golang.org/x/crypto/ssh.Session).Close
+        - (*golang.org/x/crypto/ssh.Client).Close
+        - (*github.com/pkg/sftp.Client).Close
+        - (*github.com/pkg/sftp.File).Close
+    staticcheck:
+      checks:
+        - all
+        # ST1005: error strings are user-facing messages shown to the AI
+        # client as tool results, so they're written as capitalized sentences.
+        - "-ST1005"
+        # ST1000: don't require package-level doc comments on internal
+        # packages — file-level comments are enough.
+        - "-ST1000"

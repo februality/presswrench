@@ -1,0 +1,30 @@
+package clients
+
+import "path/filepath"
+
+// Codex CLI uses ~/.codex/config.toml with [mcp_servers.<name>] tables.
+type codex struct{ p tomlPatcher }
+
+func newCodex(account string) Patcher {
+	return codex{p: tomlPatcher{
+		configPath: homePath(".codex", "config.toml"),
+		tablePath:  []string{"mcp_servers", EntryName(account)},
+	}}
+}
+
+func (c codex) ID() string          { return "codex" }
+func (c codex) DisplayName() string { return "Codex CLI" }
+
+func (c codex) Detect() (bool, string, error) {
+	parent := filepath.Dir(c.p.configPath)
+	return fileExists(parent) || fileExists(c.p.configPath), c.p.configPath, nil
+}
+
+func (c codex) Patch(binaryPath string, env map[string]string, dryRun bool) (bool, string, error) {
+	return c.p.patch(newTOMLEntry(binaryPath, env), dryRun)
+}
+
+func (c codex) Unpatch() (bool, error)                 { return c.p.unpatch() }
+func (c codex) CurrentEnv() (map[string]string, error) { return c.p.currentEnv() }
+func (c codex) Entries() ([]string, error)             { return c.p.entries() }
+func (c codex) OfficialEntries() ([]string, error)     { return c.p.officialEntries() }
