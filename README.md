@@ -71,7 +71,7 @@ An agent can't answer the wizard's prompts, so it uses the non-interactive comma
 3. **For each account, one at a time:**
    1. Ask the user to sign in at my.pressable.com in their default browser **as that account**, signing out of the previous one first.
    2. Run `presswrench login --account <name>` (no `--account` for the default). It opens the browser and waits up to 5 minutes for the user to approve, so use a long command timeout or run it in the background. In a sandboxed agent, it may need permission to run outside the sandbox to open the browser, listen on 127.0.0.1 and use the OS keychain.
-   3. Check the `✓ Signed in as <email>` line. If that email was already used for another account, the browser was signed in as the wrong user. Run `presswrench logout --account <name>`, have the user switch users, and sign in again.
+   3. Check the `◇ Signed in as <email>` line. If that email was already used for another account, the browser was signed in as the wrong user. Run `presswrench logout --account <name>`, have the user switch users, and sign in again.
    4. Run `presswrench setup --account <name> --unattended --client <id> --client <id>`, adding `--read-only` if chosen. It creates the SSH key and configures the AI tools without prompting.
    5. Give the user the printed public key. Ask them to add it in **MyPressable → Profile → Settings → SSH Keys**, signed in as that account, under the name `presswrench-<name>` (`presswrench` for the default account).
 4. **Run `presswrench doctor`.** It checks every account, including SSH. Pressable can take a minute to create SSH logins after a key is added, so if SSH fails, wait and run it again.
