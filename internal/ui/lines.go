@@ -53,11 +53,29 @@ func (u *UI) Mark(level Level) string {
 
 func (u *UI) line(level Level, title, detail string) string {
 	s := u.Mark(level) + "  " + title
-	if detail != "" {
-		s += u.st.dim.Render(" · " + detail)
+	if detail == "" {
+		return s
 	}
-	return s
+	// Warnings and failures carry what went wrong in the detail; keep it
+	// readable (colour 8 vanishes on some dark themes).
+	if level == Warn || level == Fail {
+		return s + u.g.sep + detail
+	}
+	return s + u.st.dim.Render(u.g.sep+detail)
 }
+
+// Sep returns " · " (ASCII " - "), the separator used between a title and
+// its detail, for callers that build such text themselves.
+func (u *UI) Sep() string { return u.g.sep }
+
+// Arrow returns "→" (ASCII "->"), for "Profile → Settings" style paths.
+func (u *UI) Arrow() string { return u.g.arrow }
+
+// Ellipsis returns "…" (ASCII "..."), for in-progress status text.
+func (u *UI) Ellipsis() string { return u.g.ellipsis }
+
+// Dash returns "—" (ASCII "-"), for separating a name from a description.
+func (u *UI) Dash() string { return u.g.dash }
 
 // Blank prints an empty rail line.
 func (u *UI) Blank() { u.printf("%s\n", u.st.dim.Render(u.g.rail)) }

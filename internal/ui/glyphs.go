@@ -10,12 +10,16 @@ import (
 type glyphs struct {
 	intro, rail, done, active, warn, fail, skip, outro string
 	radioOn, radioOff, checkOn, checkOff, cursor       string
-	spinner                                            spinner.Spinner
+	// Punctuation that also needs an ASCII form so a run on a legacy
+	// console never shows mojibake.
+	sep, ellipsis, arrow, dash string
+	spinner                    spinner.Spinner
 }
 
 var unicodeGlyphs = glyphs{
 	intro: "┌", rail: "│", done: "◇", active: "◆", warn: "▲", fail: "■", skip: "·", outro: "└",
 	radioOn: "●", radioOff: "○", checkOn: "◼", checkOff: "◻", cursor: "▸",
+	sep: " · ", ellipsis: "…", arrow: "→", dash: "—",
 	spinner: spinner.Spinner{
 		Frames: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		FPS:    time.Second / 12,
@@ -25,6 +29,7 @@ var unicodeGlyphs = glyphs{
 var asciiGlyphs = glyphs{
 	intro: "+", rail: "|", done: "o", active: "*", warn: "!", fail: "x", skip: "-", outro: "+",
 	radioOn: "(*)", radioOff: "( )", checkOn: "[x]", checkOff: "[ ]", cursor: ">",
+	sep: " - ", ellipsis: "...", arrow: "->", dash: "-",
 	spinner: spinner.Spinner{
 		Frames: []string{"-", "\\", "|", "/"},
 		FPS:    time.Second / 8,

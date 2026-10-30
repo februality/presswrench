@@ -90,7 +90,7 @@ func fakeSites(n int) []sites.Site {
 // key, a working clipboard, no clients and no official server.
 func fakeHooks() *Hooks {
 	return &Hooks{
-		Session: func(context.Context) (string, bool) { return "andrew@example.com", true },
+		Session: func(context.Context) (string, error) { return "andrew@example.com", nil },
 		SignIn: func(context.Context, auth.LoginOptions) (string, error) {
 			return "", errors.New("SignIn should not be called")
 		},
@@ -145,7 +145,7 @@ func TestRun_AlreadySignedIn(t *testing.T) {
 
 func TestRun_SignInFails(t *testing.T) {
 	h := fakeHooks()
-	h.Session = func(context.Context) (string, bool) { return "", false }
+	h.Session = func(context.Context) (string, error) { return "", auth.ErrLoginRequired }
 	h.SignIn = func(context.Context, auth.LoginOptions) (string, error) { return "", errors.New("boom") }
 	r := run(t, true, Options{SkipSSH: true, SkipClients: true}, h, &scriptedPrompter{})
 	if !strings.Contains(r.out, "■  boom\n") {
@@ -158,7 +158,7 @@ func TestRun_SignInFails(t *testing.T) {
 
 func TestRun_BrowserSignIn(t *testing.T) {
 	h := fakeHooks()
-	h.Session = func(context.Context) (string, bool) { return "", false }
+	h.Session = func(context.Context) (string, error) { return "", auth.ErrLoginRequired }
 	h.SignIn = func(_ context.Context, o auth.LoginOptions) (string, error) {
 		o.OnAuthorizeURL("https://auth.example/authorize?x=1", true)
 		return "jane@example.com", nil
@@ -167,14 +167,22 @@ func TestRun_BrowserSignIn(t *testing.T) {
 	if r.err != nil {
 		t.Fatalf("err: %v", r.err)
 	}
-	if !strings.Contains(r.out, "◆  Sign in to Pressable in your browser\n◇  Signed in as jane@example.com · 12 sites\n") {
+	if !strings.Contains(r.out, "◆  Sign in to Pressable in your browser\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	// The URL must reach the scrollback unwrapped and untruncated, so the
+	// user can open it when the browser didn't.
+	if !strings.Contains(r.out, "│  https://auth.example/authorize?x=1\n") {
+		t.Fatalf("authorize URL not printed raw:\n%s", r.out)
+	}
+	if !strings.Contains(r.out, "◇  Signed in as jane@example.com · 12 sites\n") {
 		t.Fatalf("output:\n%s", r.out)
 	}
 }
 
 func TestRun_ManualSignIn(t *testing.T) {
 	h := fakeHooks()
-	h.Session = func(context.Context) (string, bool) { return "", false }
+	h.Session = func(context.Context) (string, error) { return "", auth.ErrLoginRequired }
 	var pasted string
 	h.SignIn = func(_ context.Context, o auth.LoginOptions) (string, error) {
 		o.OnAuthorizeURL("https://auth.example/authorize?x=1", false)
@@ -213,9 +221,9 @@ func TestRun_NoTerminalNeedsUnattended(t *testing.T) {
 
 func TestRun_UnattendedNeedsSession(t *testing.T) {
 	h := fakeHooks()
-	h.Session = func(context.Context) (string, bool) { return "", false }
+	h.Session = func(context.Context) (string, error) { return "", errors.New("refresh failed: dial tcp: no route") }
 	r := run(t, false, Options{Unattended: true}, h, &scriptedPrompter{})
-	if r.err == nil || !strings.Contains(r.err.Error(), "presswrench login") {
+	if r.err == nil || !strings.Contains(r.err.Error(), "presswrench login") || !strings.Contains(r.err.Error(), "no route") {
 		t.Fatalf("err %v", r.err)
 	}
 }
@@ -502,5 +510,51 @@ func TestRun_CancelDuringClients(t *testing.T) {
 	}
 	if !strings.HasSuffix(r.out, "└\n") || a.patched {
 		t.Fatalf("output:\n%s\npatched=%v", r.out, a.patched)
+	}
+}
+
+func TestRun_OnlyClientsUnknownSkipsPrompt(t *testing.T) {
+	_, _, _, h := threePatchers()
+	p := &scriptedPrompter{confirms: []bool{false}}
+	r := run(t, true, Options{SkipSSH: true, OnlyClients: []string{"zzz"}}, h, p)
+	if r.err != nil {
+		t.Fatalf("err %v", r.err)
+	}
+	for _, c := range p.calls {
+		if strings.HasPrefix(c, "multi:") {
+			t.Fatalf("MultiSelect must not be shown with no options: %v", p.calls)
+		}
+	}
+	if !strings.Contains(r.out, "◇  AI tools · none configured\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+}
+
+func TestRun_ASCIIModeIsPureASCII(t *testing.T) {
+	// A full run in ASCII mode (clipboard failing so the key prints, the
+	// official-server warning, a client patched) must not emit a single
+	// non-ASCII byte: legacy consoles show them as mojibake.
+	a, _, _, h := threePatchers()
+	_ = a
+	h.Clipboard = func(string) error { return errors.New("no clipboard") }
+	h.CheckSSH = func(context.Context, string) (string, string, error) { return "", "", errors.New("denied") }
+	h.Official = func() []clients.OfficialEntry {
+		return []clients.OfficialEntry{{Client: "Claude Code", Name: "pressable", Path: "/c.json"}}
+	}
+	p := &scriptedPrompter{selects: []string{"test", "skip"}, confirms: []bool{true}, multis: [][]string{{"a"}}}
+	t.Setenv("PRESSWRENCH_ACCOUNT", "")
+	var buf bytes.Buffer
+	err := Run(Options{Out: &buf, UI: ui.NewTest(&buf, true, false, 80), Hooks: h, Prompter: p, BinaryPath: "/bin/p", Account: "dev"})
+	if err != nil {
+		t.Fatalf("err %v", err)
+	}
+	for i, b := range buf.Bytes() {
+		if b >= 0x80 {
+			line := strings.Split(buf.String()[:i], "\n")
+			t.Fatalf("non-ASCII byte at line %d: %q", len(line), line[len(line)-1])
+		}
+	}
+	if !strings.Contains(buf.String(), "o  SSH key - ") {
+		t.Fatalf("ascii separator missing:\n%s", buf.String())
 	}
 }

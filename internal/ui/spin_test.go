@@ -49,15 +49,16 @@ func TestSpin_NonInteractive(t *testing.T) {
 	var b bytes.Buffer
 	u := NewTest(&b, false, true, 80)
 	calls := 0
-	err := u.Spin("T", "working…", []string{"d"}, func(set func(string)) Outcome {
+	err := u.Spin("T", "working…", []string{"d"}, func(set func(string), note func(...string)) Outcome {
 		calls++
 		set("ignored")
+		note("https://example/very-long-url")
 		return Outcome{Level: Done, Text: "ok"}
 	})
 	if err != nil || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
-	if b.String() != "◆  T\n│  d\n◇  ok\n" {
+	if b.String() != "◆  T\n│  d\n│  https://example/very-long-url\n◇  ok\n" {
 		t.Fatalf("got %q", b.String())
 	}
 }
@@ -67,7 +68,7 @@ func TestSpin_SyncInTestUI(t *testing.T) {
 	// tests never start a Bubble Tea program.
 	var b bytes.Buffer
 	u := NewTest(&b, true, true, 80)
-	err := u.Spin("T", "w", nil, func(func(string)) Outcome { return Outcome{Level: Done, Text: "ok"} })
+	err := u.Spin("T", "w", nil, func(func(string), func(...string)) Outcome { return Outcome{Level: Done, Text: "ok"} })
 	if err != nil || b.String() != "◆  T\n◇  ok\n" {
 		t.Fatalf("err=%v got %q", err, b.String())
 	}

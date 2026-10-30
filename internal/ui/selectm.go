@@ -78,6 +78,11 @@ func (m selectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		m.done = true
 		return m, tea.Quit
+	}
+	if n == 0 {
+		return m, nil
+	}
+	switch k.Type {
 	case tea.KeyLeft, tea.KeyShiftTab:
 		m.cursor = (m.cursor + n - 1) % n
 		return m, nil
@@ -112,7 +117,11 @@ func (m selectModel) View() string {
 	case m.cancelled:
 		return u.cancelledView()
 	case m.done:
-		return u.Line(Done, m.title, m.opts[m.cursor].Label) + "\n"
+		label := ""
+		if len(m.opts) > 0 {
+			label = m.opts[m.cursor].Label
+		}
+		return u.Line(Done, m.title, label) + "\n"
 	}
 	parts := make([]string, 0, len(m.opts))
 	for i, o := range m.opts {

@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/spf13/cobra"
 
+	"github.com/februality/presswrench/internal/clients"
 	"github.com/februality/presswrench/internal/wizard"
 )
 
@@ -29,6 +33,9 @@ func NewSetup() *cobra.Command {
 			if err := validateAccount(account); err != nil {
 				return err
 			}
+			if err := validateClientIDs(onlyClients); err != nil {
+				return err
+			}
 			opts := wizard.Options{
 				Account:     account,
 				Unattended:  unattended,
@@ -53,4 +60,15 @@ func NewSetup() *cobra.Command {
 	cmd.Flags().BoolVar(&readOnly, "read-only", false, "bake PRESSWRENCH_READ_ONLY=1 into client configs (also pre-selects the read-only prompt)")
 	cmd.Flags().StringVar(&blocked, "blocked-operations", "", `comma-separated Pressable operations to refuse locally (default "delete_site"; "none" to block nothing)`)
 	return cmd
+}
+
+// validateClientIDs rejects unknown --client values up front so a typo
+// doesn't silently filter every AI tool out of the wizard.
+func validateClientIDs(ids []string) error {
+	for _, id := range ids {
+		if clients.ByID(id, "") == nil {
+			return fmt.Errorf("Unknown client %q. Valid IDs: %s", id, strings.Join(clients.IDs(), ", "))
+		}
+	}
+	return nil
 }

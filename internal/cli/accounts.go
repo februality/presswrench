@@ -117,7 +117,8 @@ func newAccountsRemove() *cobra.Command {
 					u.Step(p.DisplayName(), "removed entry")
 				}
 			}
-			u.Warn("The SSH key files on disk and the public key in MyPressable (Profile → Settings → SSH Keys) are not removed automatically", "")
+			ar := u.Arrow()
+			u.Warn(fmt.Sprintf("The SSH key files on disk and the public key in MyPressable (Profile %s Settings %s SSH Keys) are not removed automatically", ar, ar), "")
 			return nil
 		},
 	}

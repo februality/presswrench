@@ -19,8 +19,10 @@ import (
 // Hooks are the wizard's side effects, as functions so tests can
 // substitute fakes. DefaultHooks wires the real ones.
 type Hooks struct {
-	// Session reports the identity of an existing valid session, if any.
-	Session func(ctx context.Context) (identity string, ok bool)
+	// Session returns the identity of an existing valid session, or the
+	// error that stopped it from being used (auth.ErrLoginRequired when
+	// there simply isn't one).
+	Session func(ctx context.Context) (identity string, err error)
 	// SignIn runs the browser/manual login and returns the identity.
 	SignIn    func(ctx context.Context, o auth.LoginOptions) (identity string, err error)
 	ListSites func(ctx context.Context) ([]sites.Site, error)
@@ -50,12 +52,12 @@ func DefaultHooks(cfg *config.Config, store creds.Store) *Hooks {
 		return deps
 	}
 	h := &Hooks{
-		Session: func(ctx context.Context) (string, bool) {
+		Session: func(ctx context.Context) (string, error) {
 			s := auth.NewSession(store, cfg.Account, cfg.AuthURL)
 			if _, err := s.Token(ctx); err != nil {
-				return "", false
+				return "", err
 			}
-			return s.Identity(), true
+			return s.Identity(), nil
 		},
 		SignIn: func(ctx context.Context, o auth.LoginOptions) (string, error) {
 			tr, err := auth.SignIn(ctx, store, cfg.Account, o)

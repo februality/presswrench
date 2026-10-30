@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/muesli/termenv"
 )
 
 func writeSample(u *UI) {
@@ -30,7 +32,7 @@ func TestLines_Unicode(t *testing.T) {
 func TestLines_ASCII(t *testing.T) {
 	var b bytes.Buffer
 	writeSample(NewTest(&b, false, false, 80))
-	want := "+  PressWrench setup  v0.1.0\n|\no  SSH key · ~/k\no  Done\n!  W · d\nx  F\n|\n+  Done.\n"
+	want := "+  PressWrench setup  v0.1.0\n|\no  SSH key - ~/k\no  Done\n!  W - d\nx  F\n|\n+  Done.\n"
 	if b.String() != want {
 		t.Fatalf("got:\n%q\nwant:\n%q", b.String(), want)
 	}
@@ -86,5 +88,31 @@ func TestMark(t *testing.T) {
 	NewTest(&b, false, true, 80).Skip("Windsurf", "no entry")
 	if b.String() != "·  Windsurf · no entry\n" {
 		t.Fatalf("skip line %q", b.String())
+	}
+}
+
+func TestASCIIAccessors(t *testing.T) {
+	a := NewTest(io.Discard, false, false, 80)
+	if a.Arrow() != "->" || a.Ellipsis() != "..." || a.Dash() != "-" || a.Sep() != " - " {
+		t.Fatalf("ascii: %q %q %q", a.Arrow(), a.Ellipsis(), a.Dash())
+	}
+	u := NewTest(io.Discard, false, true, 80)
+	if u.Arrow() != "→" || u.Ellipsis() != "…" || u.Dash() != "—" || u.Sep() != " · " {
+		t.Fatalf("unicode: %q %q %q", u.Arrow(), u.Ellipsis(), u.Dash())
+	}
+}
+
+func TestFailDetailNotDimmed(t *testing.T) {
+	u := NewTest(io.Discard, false, true, 80)
+	u.r.SetColorProfile(termenv.ANSI)
+	u.st = newStyles(u.r)
+	if s := u.line(Fail, "A", "boom"); strings.Contains(s, "\x1b[90m") {
+		t.Fatalf("fail detail is dimmed: %q", s)
+	}
+	if s := u.line(Warn, "A", "careful"); strings.Contains(s, "\x1b[90m") {
+		t.Fatalf("warn detail is dimmed: %q", s)
+	}
+	if s := u.line(Done, "A", "ok"); !strings.Contains(s, "\x1b[90m") {
+		t.Fatalf("done detail should be dimmed: %q", s)
 	}
 }

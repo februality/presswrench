@@ -10,7 +10,6 @@
 package wizard
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -92,7 +91,7 @@ func Run(opts Options) error {
 
 	u.Intro("PressWrench setup", "v"+mcpserver.ServerVersion)
 	if opts.Account != "" {
-		u.Note(fmt.Sprintf("Account %q · entry %s", opts.Account, clients.EntryName(opts.Account)))
+		u.Note(fmt.Sprintf("Account %q%sentry %s", opts.Account, u.Sep(), clients.EntryName(opts.Account)))
 		u.Blank()
 	}
 
@@ -156,17 +155,18 @@ func signIn(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *
 		if err != nil {
 			return ui.Outcome{Level: ui.Fail, Text: fmt.Sprintf("Verify session (list_sites): %s", err)}, 0, err
 		}
-		text := fmt.Sprintf("Signed in as %s · %d sites", orDefault(identity, "your Pressable user"), len(list))
+		text := fmt.Sprintf("Signed in as %s%s%d sites", orDefault(identity, "your Pressable user"), u.Sep(), len(list))
 		if h.StoreLabel != "" {
-			text += fmt.Sprintf(" · session in %s (0600)", h.StoreLabel)
+			text += fmt.Sprintf("%ssession in %s (0600)", u.Sep(), h.StoreLabel)
 		}
 		return ui.Outcome{Level: ui.Done, Text: text}, len(list), nil
 	}
 
-	if identity, ok := h.Session(ctx); ok {
+	identity, sessErr := h.Session(ctx)
+	if sessErr == nil {
 		var n int
 		var err error
-		spinErr := u.Spin("Checking Pressable access", "Listing sites…", nil, func(func(string)) ui.Outcome {
+		spinErr := u.Spin("Checking Pressable access", "Listing sites"+u.Ellipsis(), nil, func(func(string), func(...string)) ui.Outcome {
 			var out ui.Outcome
 			out, n, err = signedIn(identity)
 			return out
@@ -180,7 +180,7 @@ func signIn(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *
 		return n, nil
 	}
 	if opts.Unattended {
-		return 0, errors.New("--unattended needs an existing session (run `presswrench login`) or PRESSWRENCH_ACCESS_TOKEN")
+		return 0, fmt.Errorf("--unattended needs an existing session (run `presswrench login`) or PRESSWRENCH_ACCESS_TOKEN: %w", sessErr)
 	}
 
 	lo := auth.LoginOptions{
@@ -195,11 +195,7 @@ func signIn(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *
 			u.Note("After approving, your browser lands on a 127.0.0.1 page that fails to load.")
 		}
 		lo.ReadLine = func() (string, error) {
-			return opts.Prompter.Text("Paste the URL your browser landed on", "http://127.0.0.1:53682/callback?…", requireNonEmpty)
-		}
-		if !u.Interactive() {
-			reader := bufio.NewReader(os.Stdin)
-			lo.ReadLine = func() (string, error) { return reader.ReadString('\n') }
+			return opts.Prompter.Text("Paste the URL your browser landed on", "http://127.0.0.1:53682/callback?"+u.Ellipsis(), requireNonEmpty)
 		}
 		identity, err := h.SignIn(ctx, lo)
 		if err != nil {
@@ -219,12 +215,16 @@ func signIn(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *
 
 	var n int
 	var err error
-	spinErr := u.Spin("Sign in to Pressable in your browser", "Opening the browser…", nil, func(set func(string)) ui.Outcome {
+	spinErr := u.Spin("Sign in to Pressable in your browser", "Opening the browser"+u.Ellipsis(), nil, func(set func(string), note func(...string)) ui.Outcome {
 		lo.OnAuthorizeURL = func(url string, opened bool) {
+			// The URL goes above the spinner via note: the status line
+			// is truncated to the terminal width and a URL never fits.
 			if opened {
-				set("Waiting for you to approve access · if the browser didn't open: " + url)
+				note("If the browser didn't open, open this URL and sign in:", url)
+				set("Waiting for you to approve access" + u.Ellipsis())
 			} else {
-				set("Open this URL and sign in: " + url)
+				note("Open this URL and sign in to Pressable:", url)
+				set("Waiting for you to approve access" + u.Ellipsis())
 			}
 		}
 		var identity string
@@ -265,7 +265,8 @@ func setupSSH(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h
 	}
 	u.Step("SSH key", detail)
 
-	instructions := fmt.Sprintf("Add it in MyPressable → Profile → Settings → SSH Keys, named %q.", cfg.SSHKeyLabel)
+	ar := u.Arrow()
+	instructions := fmt.Sprintf("Add it in MyPressable %s Profile %s Settings %s SSH Keys, named %q.", ar, ar, ar, cfg.SSHKeyLabel)
 	if opts.Unattended {
 		u.NoteRaw(pub)
 		u.Note(instructions)
@@ -301,10 +302,10 @@ func setupSSH(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h
 			return nil
 		default:
 			var ok bool
-			if err := u.Spin("Checking SSH access", "attempt 1 of 4", nil, func(set func(string)) ui.Outcome {
+			if err := u.Spin("Checking SSH access", "attempt 1 of 4", nil, func(set func(string), _ func(...string)) ui.Outcome {
 				name, user, err := pollSSH(ctx, h, set)
 				if err != nil {
-					return ui.Outcome{Level: ui.Warn, Text: "SSH not working yet · " + err.Error()}
+					return ui.Outcome{Level: ui.Warn, Text: "SSH not working yet" + u.Sep() + err.Error()}
 				}
 				ok = true
 				return ui.Outcome{Level: ui.Done, Text: fmt.Sprintf("SSH works · %s as %s", name, user)}
@@ -415,7 +416,7 @@ func patchClients(u *ui.UI, opts Options, h *Hooks) ([]string, error) {
 	}
 
 	chosen := defaults
-	if !opts.Unattended {
+	if !opts.Unattended && len(options) > 0 {
 		var err error
 		if chosen, err = opts.Prompter.MultiSelect("Configure which AI tools?", options, defaults); err != nil {
 			return nil, err
@@ -486,7 +487,7 @@ func warnOfficial(u *ui.UI, found []clients.OfficialEntry) bool {
 	}
 	u.Warn(fmt.Sprintf("Pressable's official MCP server (%s) is also configured", clients.OfficialHost), "")
 	for _, e := range found {
-		u.NoteRaw(fmt.Sprintf("%s — %s  (%s)", e.Client, e.Name, e.Path))
+		u.NoteRaw(fmt.Sprintf("%s %s %s  (%s)", e.Client, u.Dash(), e.Name, e.Path))
 	}
 	u.Note("With both loaded the AI can bypass read-only mode and blocked operations. Remove that entry if you rely on them.")
 	return true

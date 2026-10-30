@@ -69,7 +69,7 @@ func TestMultiSelect_ASCII(t *testing.T) {
 		"|  > [x] Claude Code\n" +
 		"|    [x] Cursor\n" +
 		"|    [ ] Windsurf  (not detected)\n" +
-		"|  space toggle · enter confirm · esc cancel\n" +
+		"|  space toggle - enter confirm - esc cancel\n" +
 		"+\n"
 	if got := m.View(); got != want {
 		t.Fatalf("got %q\nwant %q", got, want)
@@ -80,5 +80,13 @@ func TestMultiSelect_NonInteractive(t *testing.T) {
 	u := NewTest(io.Discard, false, true, 80)
 	if _, err := u.MultiSelect("T", toolOptions, nil); !errors.Is(err, ErrNoTerminal) {
 		t.Fatalf("err %v", err)
+	}
+}
+
+func TestMultiSelect_EmptyDoesNotPanic(t *testing.T) {
+	m := newMultiSelectModel(NewTest(io.Discard, true, true, 80), "T", nil, nil)
+	m = upd(m, key(tea.KeyDown), key(tea.KeySpace), key(tea.KeyUp), runes("a"), key(tea.KeyEnter)).(multiSelectModel)
+	if !m.done || len(m.values()) != 0 {
+		t.Fatalf("done=%v values=%v", m.done, m.values())
 	}
 }

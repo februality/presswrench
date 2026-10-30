@@ -73,7 +73,7 @@ func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, m
 			lo.ReadLine = func() (string, error) { return reader.ReadString('\n') }
 			if u.Interactive() {
 				lo.ReadLine = func() (string, error) {
-					return u.Text("Paste the URL your browser landed on", "http://127.0.0.1:53682/callback?…", func(s string) error {
+					return u.Text("Paste the URL your browser landed on", "http://127.0.0.1:53682/callback?"+u.Ellipsis(), func(s string) error {
 						if s == "" {
 							return errors.New("Paste the full URL")
 						}
@@ -95,13 +95,16 @@ func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, m
 	}
 
 	var signErr error
-	err := u.Spin("Sign in to Pressable in your browser", "Opening the browser…", nil, func(set func(string)) ui.Outcome {
+	err := u.Spin("Sign in to Pressable in your browser", "Opening the browser"+u.Ellipsis(), nil, func(set func(string), note func(...string)) ui.Outcome {
 		lo.OnAuthorizeURL = func(url string, opened bool) {
+			// note prints above the spinner untruncated; the status line
+			// is cut to the terminal width, so the URL never goes there.
 			if opened {
-				set("Waiting for you to approve access · if the browser didn't open: " + url)
+				note("If the browser didn't open, open this URL and sign in:", url)
 			} else {
-				set("Open this URL and sign in: " + url)
+				note("Open this URL and sign in to Pressable:", url)
 			}
+			set("Waiting for you to approve access" + u.Ellipsis())
 		}
 		tr, err := auth.SignIn(ctx, store, account, lo)
 		if err != nil {

@@ -123,7 +123,8 @@ func NewUninstall() *cobra.Command {
 				} else {
 					u.Skip("No SSH key files", path)
 				}
-				u.Warn("Also delete the public key from MyPressable → Profile → Settings → SSH Keys", "")
+				ar := u.Arrow()
+				u.Warn(fmt.Sprintf("Also delete the public key from MyPressable %s Profile %s Settings %s SSH Keys", ar, ar, ar), "")
 			}
 			fmt.Println()
 			u.Step("Uninstall complete", "")

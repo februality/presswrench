@@ -102,3 +102,11 @@ func TestSelect_NonInteractive(t *testing.T) {
 		t.Fatalf("wrote %q", b.String())
 	}
 }
+
+func TestSelect_EmptyDoesNotPanic(t *testing.T) {
+	m := newSelectModel(NewTest(io.Discard, true, true, 80), "T", nil, "")
+	m = upd(m, key(tea.KeyRight), key(tea.KeyLeft), runes("1"), runes("y"), key(tea.KeyEnter)).(selectModel)
+	if !m.done || m.value() != "" {
+		t.Fatalf("done=%v value=%q", m.done, m.value())
+	}
+}

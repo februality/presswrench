@@ -85,11 +85,11 @@ func doctorAccount(u *ui.UI, account, site string) error {
 
 	var list []sitesList
 	var listErr error
-	if err := u.Spin("Checking Pressable access", "Listing sites…", nil, func(func(string)) ui.Outcome {
+	if err := u.Spin("Checking Pressable access", "Listing sites"+u.Ellipsis(), nil, func(func(string), func(...string)) ui.Outcome {
 		l, err := deps.Sites.List(ctx)
 		if err != nil {
 			listErr = err
-			return ui.Outcome{Level: ui.Fail, Text: "Pressable MCP gateway · " + err.Error()}
+			return ui.Outcome{Level: ui.Fail, Text: "Pressable MCP gateway" + u.Dash() + " " + err.Error()}
 		}
 		for _, s := range l {
 			list = append(list, sitesList{id: fmt.Sprint(s.ID)})
@@ -99,7 +99,7 @@ func doctorAccount(u *ui.UI, account, site string) error {
 		return err
 	}
 	if listErr != nil {
-		return listErr
+		return ui.Reported(listErr)
 	}
 
 	if mcsh.KeyPairExists(cfg.SSHKeyPath) {
@@ -109,10 +109,10 @@ func doctorAccount(u *ui.UI, account, site string) error {
 			target = list[0].id
 		}
 		if target != "" {
-			if err := u.Spin("Checking SSH access", "Connecting…", nil, func(func(string)) ui.Outcome {
+			if err := u.Spin("Checking SSH access", "Connecting"+u.Ellipsis(), nil, func(func(string), func(...string)) ui.Outcome {
 				name, user, err := deps.CheckSSH(ctx, target)
 				if err != nil {
-					return ui.Outcome{Level: ui.Fail, Text: "SSH · " + err.Error()}
+					return ui.Outcome{Level: ui.Fail, Text: "SSH" + u.Dash() + " " + err.Error()}
 				}
 				return ui.Outcome{Level: ui.Done, Text: fmt.Sprintf("SSH login to %s as %s", name, user)}
 			}); err != nil {
@@ -120,7 +120,7 @@ func doctorAccount(u *ui.UI, account, site string) error {
 			}
 		}
 	} else {
-		u.Fail("SSH key missing", cfg.SSHKeyPath+" — run setup")
+		u.Fail("SSH key missing", cfg.SSHKeyPath+" "+u.Dash()+" run setup")
 	}
 	if cfg.ReadOnly {
 		u.Skip("PRESSWRENCH_READ_ONLY is set in this shell", "")

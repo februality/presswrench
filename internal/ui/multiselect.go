@@ -78,6 +78,11 @@ func (m multiSelectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		m.done = true
 		return m, tea.Quit
+	}
+	if n == 0 {
+		return m, nil
+	}
+	switch k.Type {
 	case tea.KeyUp:
 		m.cursor = (m.cursor + n - 1) % n
 	case tea.KeyDown:
@@ -149,7 +154,7 @@ func (m multiSelectModel) View() string {
 		}
 		b.WriteString(u.railLine(row))
 	}
-	b.WriteString(u.railLine(u.st.dim.Render("space toggle · enter confirm · esc cancel")))
+	b.WriteString(u.railLine(u.st.dim.Render("space toggle" + u.g.sep + "enter confirm" + u.g.sep + "esc cancel")))
 	b.WriteString(u.activeFooter())
 	return b.String()
 }

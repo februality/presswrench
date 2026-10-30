@@ -10,24 +10,32 @@ type spinDoneMsg Outcome
 
 // Spin shows title as the active step with a spinner and status beneath,
 // plus optional raw detail lines (never wrapped). fn runs in a goroutine;
-// set replaces the status text. fn's Outcome becomes the step's final
-// line. Returns ErrCancelled if the user presses Ctrl+C while waiting, in
-// which case fn is abandoned.
+// set replaces the status text and note prints rail lines into the
+// scrollback above the spinner. Bubble Tea truncates the managed status
+// line to the terminal width, so anything the user must read in full (a
+// URL, a key) goes through note, never set. fn's Outcome becomes the
+// step's final line. Returns ErrCancelled if the user presses Ctrl+C while
+// waiting, in which case fn is abandoned.
 //
 // When the UI isn't interactive, the title and detail are printed once,
 // fn runs synchronously and the outcome line follows.
-func (u *UI) Spin(title, status string, detail []string, fn func(set func(status string)) Outcome) error {
+func (u *UI) Spin(title, status string, detail []string, fn func(set func(status string), note func(lines ...string)) Outcome) error {
 	if !u.interactive || u.syncSpin {
 		u.printf("%s", u.activeHeader(title))
 		u.NoteRaw(detail...)
-		out := fn(func(string) {})
+		out := fn(func(string) {}, u.NoteRaw)
 		u.printf("%s\n", u.line(out.Level, out.Text, ""))
 		return nil
 	}
 	m := newSpinModel(u, title, status, detail)
 	p := tea.NewProgram(m, tea.WithInput(u.in), tea.WithOutput(u.out))
+	note := func(lines ...string) {
+		for _, l := range lines {
+			p.Println(u.st.dim.Render(u.g.rail) + "  " + l)
+		}
+	}
 	go func() {
-		out := fn(func(s string) { p.Send(spinStatusMsg(s)) })
+		out := fn(func(s string) { p.Send(spinStatusMsg(s)) }, note)
 		p.Send(spinDoneMsg(out))
 	}()
 	final, err := p.Run()
