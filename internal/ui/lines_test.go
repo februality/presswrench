@@ -2,6 +2,7 @@ package ui
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -69,5 +70,21 @@ func TestNoteRaw_NoWrap(t *testing.T) {
 	u.NoteRaw(s)
 	if b.String() != "│  "+s+"\n" {
 		t.Fatalf("got %q", b.String())
+	}
+}
+
+func TestMark(t *testing.T) {
+	u := NewTest(io.Discard, false, true, 80)
+	if u.Mark(Done) != "◇" || u.Mark(Warn) != "▲" || u.Mark(Fail) != "■" || u.Mark(Skip) != "·" {
+		t.Fatalf("unicode marks: %q %q %q %q", u.Mark(Done), u.Mark(Warn), u.Mark(Fail), u.Mark(Skip))
+	}
+	a := NewTest(io.Discard, false, false, 80)
+	if a.Mark(Done) != "o" || a.Mark(Skip) != "-" {
+		t.Fatalf("ascii marks: %q %q", a.Mark(Done), a.Mark(Skip))
+	}
+	var b bytes.Buffer
+	NewTest(&b, false, true, 80).Skip("Windsurf", "no entry")
+	if b.String() != "·  Windsurf · no entry\n" {
+		t.Fatalf("skip line %q", b.String())
 	}
 }

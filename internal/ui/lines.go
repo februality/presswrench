@@ -27,6 +27,9 @@ func (u *UI) Warn(title, detail string) { u.printf("%s\n", u.line(Warn, title, d
 // Fail prints a failure line.
 func (u *UI) Fail(title, detail string) { u.printf("%s\n", u.line(Fail, title, detail)) }
 
+// Skip prints a neutral "nothing to do" line.
+func (u *UI) Skip(title, detail string) { u.printf("%s\n", u.line(Skip, title, detail)) }
+
 // Line returns a finished line for the given level, without a newline.
 // Prompts and spinners use it for their final view.
 func (u *UI) Line(level Level, title, detail string) string {
@@ -41,6 +44,8 @@ func (u *UI) Mark(level Level) string {
 		return u.st.warn.Render(u.g.warn)
 	case Fail:
 		return u.st.fail.Render(u.g.fail)
+	case Skip:
+		return u.st.dim.Render(u.g.skip)
 	default:
 		return u.st.done.Render(u.g.done)
 	}

@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/clients"
 	"github.com/februality/presswrench/internal/creds"
+	"github.com/februality/presswrench/internal/ui"
 )
 
 // NewAccounts returns the `accounts` parent command (list, remove).
@@ -47,21 +50,24 @@ func newAccountsList() *cobra.Command {
 				fmt.Println(string(b))
 				return nil
 			}
+			u := ui.New(os.Stdout, os.Stdin)
 			if len(rows) == 0 {
-				fmt.Println("No accounts configured. Run: presswrench setup")
+				u.Skip("No accounts configured", "run presswrench setup")
 				return nil
 			}
 			fmt.Printf("%-20s  %-12s  %s\n", "ACCOUNT", "SIGNED IN", "CLIENT ENTRIES")
 			for _, r := range rows {
-				cred := "✗"
+				cred := u.Mark(ui.Fail)
 				if r.HasCredentials {
-					cred = "✓"
+					cred = u.Mark(ui.Done)
 				}
 				entries := "(none)"
 				if len(r.ClientEntries) > 0 {
 					entries = joinSorted(r.ClientEntries)
 				}
-				fmt.Printf("%-20s  %-12s  %s\n", accountLabel(r.Name), cred, entries)
+				// The mark is one visible cell; pad by hand since it may
+				// carry colour codes.
+				fmt.Printf("%-20s  %s%s  %s\n", accountLabel(r.Name), cred, strings.Repeat(" ", 11), entries)
 			}
 			return nil
 		},
@@ -99,19 +105,19 @@ func newAccountsRemove() *cobra.Command {
 				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
 			}
 			_ = creds.DeleteSession(store, account)
-			fmt.Printf("  ✓ Signed out and removed the session for %s\n", account)
+			u := ui.New(os.Stdout, os.Stdin)
+			u.Step("Signed out and removed the session", "account "+account)
 			for _, p := range clients.All(account) {
 				changed, err := p.Unpatch()
 				if err != nil {
-					fmt.Printf("  ✗ %s: %s\n", p.DisplayName(), err)
+					u.Fail(p.DisplayName(), err.Error())
 					continue
 				}
 				if changed {
-					fmt.Printf("  ✓ %s — removed entry\n", p.DisplayName())
+					u.Step(p.DisplayName(), "removed entry")
 				}
 			}
-			fmt.Println("\nNote: the SSH key files on disk and the public key in MyPressable")
-			fmt.Println("(Profile → Settings → SSH Keys) are NOT removed automatically.")
+			u.Warn("The SSH key files on disk and the public key in MyPressable (Profile → Settings → SSH Keys) are not removed automatically", "")
 			return nil
 		},
 	}

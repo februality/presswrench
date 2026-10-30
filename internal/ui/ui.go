@@ -53,6 +53,8 @@ const (
 	Done Level = iota
 	Warn
 	Fail
+	// Skip marks a neutral "nothing to do" line (dim).
+	Skip
 )
 
 // Outcome is what a Spin's function reports when it finishes.

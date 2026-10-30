@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/februality/presswrench/internal/clients"
+	"github.com/februality/presswrench/internal/ui"
 )
 
 func NewInstall() *cobra.Command {
@@ -60,8 +61,9 @@ func NewInstall() *cobra.Command {
 				}
 			}
 
+			u := ui.New(os.Stdout, os.Stdin)
 			if len(targets) == 0 {
-				fmt.Println("No MCP clients detected to install into.")
+				u.Skip("No MCP clients detected to install into", "")
 				return nil
 			}
 
@@ -81,19 +83,20 @@ func NewInstall() *cobra.Command {
 			for _, p := range targets {
 				changed, diff, err := p.Patch(binaryPath, env, dryRun)
 				if err != nil {
-					fmt.Printf("  ✗ %s: %s\n", p.DisplayName(), err)
+					u.Fail(p.DisplayName(), err.Error())
 					continue
 				}
 				_, path, _ := p.Detect()
 				switch {
 				case dryRun && changed:
-					fmt.Printf("  ~ %s — would patch %s\n%s", p.DisplayName(), path, diff)
+					u.Warn(p.DisplayName(), "would patch "+path)
+					fmt.Print(diff)
 				case dryRun:
-					fmt.Printf("  · %s — no changes needed\n", p.DisplayName())
+					u.Skip(p.DisplayName(), "no changes needed")
 				case changed:
-					fmt.Printf("  ✓ %s — patched %s\n", p.DisplayName(), path)
+					u.Step(p.DisplayName(), "patched "+path)
 				default:
-					fmt.Printf("  · %s — already configured\n", p.DisplayName())
+					u.Skip(p.DisplayName(), "already configured")
 				}
 			}
 			return nil

@@ -24,20 +24,20 @@ func NewDoctor() *cobra.Command {
 		Use:   "doctor",
 		Short: "Diagnose the session, Pressable access, SSH, and per-client configs",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runDoctor(site)
+			return runDoctor(ui.New(os.Stdout, os.Stdin), site)
 		},
 	}
 	cmd.Flags().StringVar(&site, "site", "", "site to test SSH against (default: the first accessible site)")
 	return cmd
 }
 
-func runDoctor(site string) error {
+func runDoctor(u *ui.UI, site string) error {
 	fmt.Println("Running diagnostics…")
 	fmt.Println()
 
 	accts := discoveredAccounts()
 	if len(accts) == 0 && os.Getenv(auth.EnvAccessToken) == "" {
-		fmt.Println("  ✗ No accounts configured. Run: presswrench setup")
+		u.Fail("No accounts configured", "run presswrench setup")
 		return errors.New("not signed in")
 	}
 	if len(accts) == 0 {
@@ -47,19 +47,19 @@ func runDoctor(site string) error {
 	var firstErr error
 	for _, account := range accts {
 		fmt.Printf("Account: %s\n", accountLabel(account))
-		if err := doctorAccount(account, site); err != nil && firstErr == nil {
+		if err := doctorAccount(u, account, site); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		fmt.Println()
 	}
-	wizard.WarnOfficial(ui.New(os.Stdout, os.Stdin))
+	wizard.WarnOfficial(u)
 	if firstErr == nil {
 		fmt.Println("All checks complete.")
 	}
 	return firstErr
 }
 
-func doctorAccount(account, site string) error {
+func doctorAccount(u *ui.UI, account, site string) error {
 	ctx := context.Background()
 	cfg, err := loadConfigFor(account)
 	if err != nil {
@@ -67,7 +67,7 @@ func doctorAccount(account, site string) error {
 	}
 	store, err := creds.Open()
 	if err != nil {
-		fmt.Printf("  ✗ Credentials store error: %s\n", err)
+		u.Fail("Credentials store", err.Error())
 		return err
 	}
 	deps := mcpserver.Build(cfg, store)
@@ -75,39 +75,55 @@ func doctorAccount(account, site string) error {
 
 	if _, err := deps.Session.Token(ctx); err != nil {
 		if errors.Is(err, auth.ErrLoginRequired) {
-			fmt.Printf("  ✗ Not signed in. Run: %s\n", loginCommand(account))
+			u.Fail("Not signed in", "run "+loginCommand(account))
 		} else {
-			fmt.Printf("  ✗ Session refresh failed: %s\n", err)
+			u.Fail("Session refresh failed", err.Error())
 		}
 		return fmt.Errorf("no usable session for %s", accountLabel(account))
 	}
-	fmt.Printf("  ✓ Signed in as %s (source: %s)\n", orUnknown(deps.Session.Identity()), deps.Session.Source())
+	u.Step("Signed in as "+orUnknown(deps.Session.Identity()), "source: "+string(deps.Session.Source()))
 
-	list, err := deps.Sites.List(ctx)
-	if err != nil {
-		fmt.Printf("  ✗ Pressable MCP gateway: %s\n", err)
+	var list []sitesList
+	var listErr error
+	if err := u.Spin("Checking Pressable access", "Listing sites…", nil, func(func(string)) ui.Outcome {
+		l, err := deps.Sites.List(ctx)
+		if err != nil {
+			listErr = err
+			return ui.Outcome{Level: ui.Fail, Text: "Pressable MCP gateway · " + err.Error()}
+		}
+		for _, s := range l {
+			list = append(list, sitesList{id: fmt.Sprint(s.ID)})
+		}
+		return ui.Outcome{Level: ui.Done, Text: fmt.Sprintf("Pressable MCP gateway reachable · %d sites accessible", len(l))}
+	}); err != nil {
 		return err
 	}
-	fmt.Printf("  ✓ Pressable MCP gateway reachable (%d sites accessible)\n", len(list))
+	if listErr != nil {
+		return listErr
+	}
 
 	if mcsh.KeyPairExists(cfg.SSHKeyPath) {
-		fmt.Printf("  ✓ SSH key at %s (label %q)\n", cfg.SSHKeyPath, cfg.SSHKeyLabel)
+		u.Step("SSH key", fmt.Sprintf("%s (label %q)", cfg.SSHKeyPath, cfg.SSHKeyLabel))
 		target := site
 		if target == "" && len(list) > 0 {
-			target = fmt.Sprint(list[0].ID)
+			target = list[0].id
 		}
 		if target != "" {
-			if name, user, err := deps.CheckSSH(ctx, target); err == nil {
-				fmt.Printf("  ✓ SSH login to %s as %s\n", name, user)
-			} else {
-				fmt.Printf("  ✗ SSH: %s\n", err)
+			if err := u.Spin("Checking SSH access", "Connecting…", nil, func(func(string)) ui.Outcome {
+				name, user, err := deps.CheckSSH(ctx, target)
+				if err != nil {
+					return ui.Outcome{Level: ui.Fail, Text: "SSH · " + err.Error()}
+				}
+				return ui.Outcome{Level: ui.Done, Text: fmt.Sprintf("SSH login to %s as %s", name, user)}
+			}); err != nil {
+				return err
 			}
 		}
 	} else {
-		fmt.Printf("  ✗ SSH key missing at %s — run setup\n", cfg.SSHKeyPath)
+		u.Fail("SSH key missing", cfg.SSHKeyPath+" — run setup")
 	}
 	if cfg.ReadOnly {
-		fmt.Println("  · PRESSWRENCH_READ_ONLY is set in this shell")
+		u.Skip("PRESSWRENCH_READ_ONLY is set in this shell", "")
 	}
 
 	fmt.Println("  AI-tool configs:")
@@ -115,7 +131,7 @@ func doctorAccount(account, site string) error {
 		_, path, _ := p.Detect()
 		entries, err := p.Entries()
 		if err != nil {
-			fmt.Printf("    ✗ %-16s %s\n", p.DisplayName(), err)
+			fmt.Printf("    %s %-16s %s\n", u.Mark(ui.Fail), p.DisplayName(), err)
 			continue
 		}
 		hasEntry := false
@@ -127,9 +143,9 @@ func doctorAccount(account, site string) error {
 		}
 		if !hasEntry {
 			if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-				fmt.Printf("    · %-16s no config file at %s\n", p.DisplayName(), path)
+				fmt.Printf("    %s %-16s no config file at %s\n", u.Mark(ui.Skip), p.DisplayName(), path)
 			} else {
-				fmt.Printf("    · %-16s no entry for this account\n", p.DisplayName())
+				fmt.Printf("    %s %-16s no entry for this account\n", u.Mark(ui.Skip), p.DisplayName())
 			}
 			continue
 		}
@@ -137,7 +153,10 @@ func doctorAccount(account, site string) error {
 		if env, envErr := p.CurrentEnv(); envErr == nil && config.IsTrueEnv(env[readOnlyEnvVar]) {
 			roSuffix = "  [read-only]"
 		}
-		fmt.Printf("    ✓ %-16s configured at %s%s\n", p.DisplayName(), path, roSuffix)
+		fmt.Printf("    %s %-16s configured at %s%s\n", u.Mark(ui.Done), p.DisplayName(), path, roSuffix)
 	}
 	return nil
 }
+
+// sitesList is the subset of a site doctor needs.
+type sitesList struct{ id string }

@@ -8,13 +8,13 @@ import (
 )
 
 type glyphs struct {
-	intro, rail, done, active, warn, fail, outro string
-	radioOn, radioOff, checkOn, checkOff, cursor string
-	spinner                                      spinner.Spinner
+	intro, rail, done, active, warn, fail, skip, outro string
+	radioOn, radioOff, checkOn, checkOff, cursor       string
+	spinner                                            spinner.Spinner
 }
 
 var unicodeGlyphs = glyphs{
-	intro: "┌", rail: "│", done: "◇", active: "◆", warn: "▲", fail: "■", outro: "└",
+	intro: "┌", rail: "│", done: "◇", active: "◆", warn: "▲", fail: "■", skip: "·", outro: "└",
 	radioOn: "●", radioOff: "○", checkOn: "◼", checkOff: "◻", cursor: "▸",
 	spinner: spinner.Spinner{
 		Frames: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
@@ -23,7 +23,7 @@ var unicodeGlyphs = glyphs{
 }
 
 var asciiGlyphs = glyphs{
-	intro: "+", rail: "|", done: "o", active: "*", warn: "!", fail: "x", outro: "+",
+	intro: "+", rail: "|", done: "o", active: "*", warn: "!", fail: "x", skip: "-", outro: "+",
 	radioOn: "(*)", radioOff: "( )", checkOn: "[x]", checkOff: "[ ]", cursor: ">",
 	spinner: spinner.Spinner{
 		Frames: []string{"-", "\\", "|", "/"},

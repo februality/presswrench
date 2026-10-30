@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/februality/presswrench/internal/config"
 	"github.com/februality/presswrench/internal/creds"
 	mcsh "github.com/februality/presswrench/internal/ssh"
+	"github.com/februality/presswrench/internal/ui"
 )
 
 func NewUninstall() *cobra.Command {
@@ -58,39 +58,41 @@ func NewUninstall() *cobra.Command {
 				}
 			}
 
+			u := ui.New(os.Stdout, os.Stdin)
 			for _, p := range targets {
 				if allAccounts {
 					accts, err := p.Entries()
 					if err != nil {
-						fmt.Printf("  ✗ %s: %s\n", p.DisplayName(), err)
+						u.Fail(p.DisplayName(), err.Error())
 						continue
 					}
 					if len(accts) == 0 {
-						fmt.Printf("  · %s — no entries found\n", p.DisplayName())
+						u.Skip(p.DisplayName(), "no entries found")
 						continue
 					}
 					for _, acct := range accts {
 						unp := clients.ByID(p.ID(), acct)
 						changed, err := unp.Unpatch()
+						label := fmt.Sprintf("%s [%s]", p.DisplayName(), accountLabel(acct))
 						if err != nil {
-							fmt.Printf("  ✗ %s [%s]: %s\n", p.DisplayName(), accountLabel(acct), err)
+							u.Fail(label, err.Error())
 							continue
 						}
 						if changed {
-							fmt.Printf("  ✓ %s [%s] — removed entry\n", p.DisplayName(), accountLabel(acct))
+							u.Step(label, "removed entry")
 						}
 					}
 					continue
 				}
 				changed, err := p.Unpatch()
 				if err != nil {
-					fmt.Printf("  ✗ %s: %s\n", p.DisplayName(), err)
+					u.Fail(p.DisplayName(), err.Error())
 					continue
 				}
 				if changed {
-					fmt.Printf("  ✓ %s — removed entry\n", p.DisplayName())
+					u.Step(p.DisplayName(), "removed entry")
 				} else {
-					fmt.Printf("  · %s — no entry found\n", p.DisplayName())
+					u.Skip(p.DisplayName(), "no entry found")
 				}
 			}
 
@@ -105,7 +107,7 @@ func NewUninstall() *cobra.Command {
 				}
 				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
 				_ = creds.DeleteSession(store, account)
-				fmt.Printf("  ✓ Signed out and removed the stored session for %s\n", accountLabel(account))
+				u.Step("Signed out and removed the stored session", "account "+accountLabel(account))
 			}
 
 			if removeKey {
@@ -117,14 +119,14 @@ func NewUninstall() *cobra.Command {
 				if mcsh.KeyPairExists(path) {
 					_ = os.Remove(path)
 					_ = os.Remove(path + ".pub")
-					fmt.Printf("  ✓ Removed SSH key files at %s{,.pub}\n", path)
+					u.Step("Removed SSH key files", path+"{,.pub}")
 				} else {
-					fmt.Printf("  · No SSH key files at %s\n", path)
+					u.Skip("No SSH key files", path)
 				}
-				fmt.Println("  Note: also delete the public key from MyPressable → Profile → Settings → SSH Keys.")
+				u.Warn("Also delete the public key from MyPressable → Profile → Settings → SSH Keys", "")
 			}
 			fmt.Println()
-			fmt.Println(strings.TrimSpace("Uninstall complete."))
+			u.Step("Uninstall complete", "")
 			return nil
 		},
 	}

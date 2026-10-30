@@ -13,6 +13,7 @@ import (
 	"github.com/februality/presswrench/internal/config"
 	"github.com/februality/presswrench/internal/creds"
 	mcsh "github.com/februality/presswrench/internal/ssh"
+	"github.com/februality/presswrench/internal/ui"
 )
 
 const readOnlyEnvVar = "PRESSWRENCH_READ_ONLY"
@@ -76,7 +77,7 @@ func NewStatus() *cobra.Command {
 				fmt.Println(string(b))
 				return nil
 			}
-			printStatusHuman(out)
+			printStatusHuman(ui.New(os.Stdout, os.Stdin), out)
 			return nil
 		},
 	}
@@ -165,7 +166,7 @@ func buildAccountStatus(account string) accountStatus {
 	return as
 }
 
-func printStatusHuman(s statusOutput) {
+func printStatusHuman(u *ui.UI, s statusOutput) {
 	fmt.Printf("presswrench %s\n", s.Version)
 	fmt.Printf("Binary:      %s\n\n", s.BinaryPath)
 
@@ -173,22 +174,22 @@ func printStatusHuman(s statusOutput) {
 		fmt.Printf("Account: %s\n", accountLabel(a.Name))
 
 		if a.Session.SignedIn {
-			fmt.Printf("  Session      ✓ %s (source: %s)\n", orUnknown(a.Session.Identity), a.Session.Source)
+			fmt.Printf("  Session      %s %s (source: %s)\n", u.Mark(ui.Done), orUnknown(a.Session.Identity), a.Session.Source)
 		} else {
-			fmt.Printf("  Session      ✗ Not signed in. Run: %s\n", loginCommand(a.Name))
+			fmt.Printf("  Session      %s Not signed in. Run: %s\n", u.Mark(ui.Fail), loginCommand(a.Name))
 		}
 
 		if a.SSHKey.Exists {
-			fmt.Printf("  SSH key      ✓ %s (label %q)\n", a.SSHKey.Path, a.SSHKey.Label)
+			fmt.Printf("  SSH key      %s %s (label %q)\n", u.Mark(ui.Done), a.SSHKey.Path, a.SSHKey.Label)
 		} else {
-			fmt.Printf("  SSH key      ✗ Missing at %s\n", a.SSHKey.Path)
+			fmt.Printf("  SSH key      %s Missing at %s\n", u.Mark(ui.Fail), a.SSHKey.Path)
 		}
 
 		fmt.Println("  AI tools:")
 		for _, c := range a.Clients {
-			mark := "·"
+			mark := u.Mark(ui.Skip)
 			if c.HasEntry {
-				mark = "✓"
+				mark = u.Mark(ui.Done)
 			}
 			suffix := ""
 			if c.ReadOnly {
