@@ -17,7 +17,7 @@ import (
 
 const (
 	ServerName    = "presswrench"
-	ServerVersion = "0.1.0"
+	ServerVersion = "0.2.0"
 )
 
 // Gateway is the slice of *gateway.Client the tools use. An interface so

@@ -10,6 +10,7 @@ import (
 
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/clients"
+	"github.com/februality/presswrench/internal/mcpserver"
 	"github.com/februality/presswrench/internal/sites"
 	mcsh "github.com/februality/presswrench/internal/ssh"
 	"github.com/februality/presswrench/internal/ui"
@@ -131,7 +132,7 @@ func TestRun_AlreadySignedIn(t *testing.T) {
 	if r.err != nil {
 		t.Fatalf("err: %v", r.err)
 	}
-	want := "┌  PressWrench setup  v0.1.0\n│\n" +
+	want := "┌  PressWrench setup  v" + mcpserver.ServerVersion + "\n│\n" +
 		"◆  Checking Pressable access\n" +
 		"◇  Signed in as andrew@example.com · 12 sites\n" +
 		"│\n└  Done. Run `presswrench doctor` to verify.\n"
@@ -239,7 +240,7 @@ func TestRun_FileStoreNote(t *testing.T) {
 
 func TestRun_AccountNote(t *testing.T) {
 	r := run(t, true, Options{Account: "dev", SkipSSH: true, SkipClients: true}, fakeHooks(), &scriptedPrompter{})
-	if !strings.HasPrefix(r.out, "┌  PressWrench setup  v0.1.0\n│\n│  Account \"dev\" · entry presswrench-dev\n│\n") {
+	if !strings.HasPrefix(r.out, "┌  PressWrench setup  v"+mcpserver.ServerVersion+"\n│\n│  Account \"dev\" · entry presswrench-dev\n│\n") {
 		t.Fatalf("output:\n%s", r.out)
 	}
 }
