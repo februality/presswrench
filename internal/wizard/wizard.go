@@ -3,8 +3,10 @@
 // browser, create an SSH key and walk the user through adding it in
 // MyPressable, then patch every detected MCP-client config.
 //
-// All prompts go through the Prompter interface so tests (and the
-// --unattended path) can substitute scripted answers.
+// Output is rendered by internal/ui in the "rail" style: one line per
+// finished step, an inline prompt or spinner for the active one. Prompts
+// go through the Prompter interface and side effects through Hooks so
+// tests (and the --unattended path) never touch a terminal or Pressable.
 package wizard
 
 import (
@@ -14,23 +16,21 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
-	"time"
-
-	"github.com/atotto/clipboard"
 
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/clients"
 	"github.com/februality/presswrench/internal/config"
 	"github.com/februality/presswrench/internal/creds"
 	"github.com/februality/presswrench/internal/mcpserver"
-	mcsh "github.com/februality/presswrench/internal/ssh"
+	"github.com/februality/presswrench/internal/ui"
 )
 
 // Options configure a wizard run.
 type Options struct {
 	Out         io.Writer
-	Prompter    Prompter
+	UI          *ui.UI   // nil → ui.New(Out, os.Stdin)
+	Prompter    Prompter // nil → UI
+	Hooks       *Hooks   // nil → DefaultHooks
 	Account     string   // "" = default account; otherwise a named account slug
 	Unattended  bool     // skip prompts; requires an existing session or PRESSWRENCH_ACCESS_TOKEN
 	ManualLogin bool     // paste the redirect URL instead of using a loopback listener
@@ -45,14 +45,22 @@ type Options struct {
 	BlockedOperations *string
 }
 
-// Run executes the setup flow. Returns the first fatal error or nil.
+// Run executes the setup flow. Errors the UI has already shown come back
+// wrapped by ui.Reported so main doesn't print them twice.
 func Run(opts Options) error {
 	ctx := context.Background()
 	if opts.Out == nil {
 		opts.Out = os.Stdout
 	}
+	if opts.UI == nil {
+		opts.UI = ui.New(opts.Out, os.Stdin)
+	}
+	u := opts.UI
+	if !u.Interactive() && !opts.Unattended {
+		return ui.ErrNoTerminal
+	}
 	if opts.Prompter == nil {
-		opts.Prompter = NewPrompter()
+		opts.Prompter = u
 	}
 	if opts.BinaryPath == "" {
 		bp, err := os.Executable()
@@ -70,111 +78,159 @@ func Run(opts Options) error {
 	if err != nil {
 		return err
 	}
-	w := opts.Out
+	if opts.Hooks == nil {
+		store, err := creds.Open()
+		if err != nil {
+			return fmt.Errorf("open credentials store: %w", err)
+		}
+		opts.Hooks = DefaultHooks(cfg, store)
+	}
+	h := opts.Hooks
 
-	printBanner(w)
+	u.Intro("PressWrench setup", "v"+mcpserver.ServerVersion)
 	if opts.Account != "" {
-		fmt.Fprintf(w, "  Setting up account %q — session, SSH key, and client entry suffixed -%s.\n\n", opts.Account, opts.Account)
+		u.Note(fmt.Sprintf("Account %q · entry %s", opts.Account, clients.EntryName(opts.Account)))
+		u.Blank()
 	}
 
-	store, err := creds.Open()
-	if err != nil {
-		return fmt.Errorf("open credentials store: %w", err)
-	}
-
-	// Step 1: sign in.
-	if err := ensureSignedIn(ctx, w, opts, cfg, store); err != nil {
+	err = runSteps(ctx, u, opts, cfg, h)
+	switch {
+	case errors.Is(err, ui.ErrCancelled):
+		// The prompt already printed "■ Cancelled."; close the rail.
+		u.Outro("")
+		return ui.Reported(err)
+	case err != nil:
 		return err
 	}
-	deps := mcpserver.Build(cfg, store)
-	list, err := deps.Sites.List(ctx)
-	if err != nil {
-		return fmt.Errorf("verify session (list_sites): %w", err)
-	}
-	who := deps.Session.Identity()
-	if who == "" {
-		who = "your Pressable user"
-	}
-	fmt.Fprintf(w, "  ✓ Signed in as %s — %d sites accessible\n", who, len(list))
-	fmt.Fprintf(w, "  ✓ Session stored in %s\n\n", backendLabel(store))
-
-	// Step 2: SSH key.
-	if !opts.SkipSSH {
-		if err := setupSSH(ctx, w, opts, cfg, deps, len(list)); err != nil {
-			return err
-		}
-	}
-
-	// Step 3: read-only opt-in (baked into the client configs in step 4).
-	if !opts.SkipClients && !opts.Unattended {
-		ro, err := opts.Prompter.Confirm(
-			"Run in read-only mode? Hides pressable_ssh_exec, pressable_wp_cli and pressable_sftp_write, and only lets "+
-				"Pressable operations marked read-only through.",
-			opts.ReadOnly,
-		)
-		if err != nil {
-			return err
-		}
-		opts.ReadOnly = ro
-	}
-	if opts.ReadOnly {
-		fmt.Fprintln(w, "  ✓ Read-only mode: ON")
-		fmt.Fprintln(w)
-	}
-
-	// Step 4: patch clients.
-	var patched []string
-	if !opts.SkipClients {
-		if patched, err = patchClients(w, opts); err != nil {
-			return err
-		}
-	}
-
-	WarnOfficial(w)
-	printSummary(w, opts, cfg, patched)
 	return nil
 }
 
-func backendLabel(store creds.Store) string {
-	if fs, ok := store.(*creds.FileStore); ok {
-		return fs.Path() + " (mode 0600)"
+func runSteps(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *Hooks) error {
+	siteCount, err := signIn(ctx, u, opts, cfg, h)
+	if err != nil {
+		return err
 	}
-	return "the OS keychain"
+	_ = siteCount
+
+	var patched []string
+	warnOfficial(u, h.Official())
+	u.Blank()
+	if len(patched) > 0 {
+		u.Outro("Done. Restart your AI tool, then run `presswrench doctor`.")
+	} else {
+		u.Outro("Done. Run `presswrench doctor` to verify.")
+	}
+	return nil
 }
 
-func ensureSignedIn(ctx context.Context, w io.Writer, opts Options, cfg *config.Config, store creds.Store) error {
-	session := auth.NewSession(store, cfg.Account, cfg.AuthURL)
-	_, tokErr := session.Token(ctx)
-	if tokErr == nil {
-		if opts.Unattended {
-			return nil
+// fail prints err as a failure line and marks it reported.
+func fail(u *ui.UI, err error) error {
+	u.Fail(err.Error(), "")
+	return ui.Reported(err)
+}
+
+// signIn makes sure there's a session and returns the number of sites it
+// can see.
+func signIn(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *Hooks) (int, error) {
+	signedIn := func(identity string) (ui.Outcome, int, error) {
+		list, err := h.ListSites(ctx)
+		if err != nil {
+			return ui.Outcome{Level: ui.Fail, Text: fmt.Sprintf("Verify session (list_sites): %s", err)}, 0, err
 		}
-		again, err := opts.Prompter.Confirm(
-			fmt.Sprintf("Already signed in as %s. Sign in again?", orDefault(session.Identity(), "a Pressable user")),
-			false,
-		)
-		if err != nil || !again {
-			return err
+		text := fmt.Sprintf("Signed in as %s · %d sites", orDefault(identity, "your Pressable user"), len(list))
+		if h.StoreLabel != "" {
+			text += fmt.Sprintf(" · session in %s (0600)", h.StoreLabel)
 		}
-	} else if opts.Unattended {
-		return fmt.Errorf("--unattended needs an existing session (run `presswrench login`) or PRESSWRENCH_ACCESS_TOKEN: %w", tokErr)
+		return ui.Outcome{Level: ui.Done, Text: text}, len(list), nil
 	}
 
-	fmt.Fprintln(w, "  Step 1 — Sign in to Pressable")
-	fmt.Fprintln(w, "  You'll approve access in your browser as yourself; the AI tool gets exactly")
-	fmt.Fprintln(w, "  the sites and permissions your Pressable account has.")
-	fmt.Fprintln(w)
-	reader := bufio.NewReader(os.Stdin)
-	_, err := auth.SignIn(ctx, store, cfg.Account, auth.LoginOptions{
+	if identity, ok := h.Session(ctx); ok {
+		var n int
+		var err error
+		spinErr := u.Spin("Checking Pressable access", "Listing sites…", nil, func(func(string)) ui.Outcome {
+			var out ui.Outcome
+			out, n, err = signedIn(identity)
+			return out
+		})
+		if spinErr != nil {
+			return 0, spinErr
+		}
+		if err != nil {
+			return 0, ui.Reported(err)
+		}
+		return n, nil
+	}
+	if opts.Unattended {
+		return 0, errors.New("--unattended needs an existing session (run `presswrench login`) or PRESSWRENCH_ACCESS_TOKEN")
+	}
+
+	lo := auth.LoginOptions{
 		AuthURL:     cfg.AuthURL,
 		OpenBrowser: auth.OpenBrowser,
 		Manual:      opts.ManualLogin,
-		ReadLine:    func() (string, error) { return reader.ReadString('\n') },
-		OnAuthorizeURL: func(u string, _ bool) {
-			fmt.Fprintf(w, "  Open this URL if your browser didn't:\n\n    %s\n\n", u)
-		},
+	}
+
+	if opts.ManualLogin {
+		lo.OnAuthorizeURL = func(url string, _ bool) {
+			u.NoteRaw("Open this URL and sign in to Pressable:", url)
+			u.Note("After approving, your browser lands on a 127.0.0.1 page that fails to load.")
+		}
+		lo.ReadLine = func() (string, error) {
+			return opts.Prompter.Text("Paste the URL your browser landed on", "http://127.0.0.1:53682/callback?…", requireNonEmpty)
+		}
+		if !u.Interactive() {
+			reader := bufio.NewReader(os.Stdin)
+			lo.ReadLine = func() (string, error) { return reader.ReadString('\n') }
+		}
+		identity, err := h.SignIn(ctx, lo)
+		if err != nil {
+			if errors.Is(err, ui.ErrCancelled) {
+				return 0, err
+			}
+			return 0, fail(u, err)
+		}
+		out, n, err := signedIn(identity)
+		if err != nil {
+			u.Fail(out.Text, "")
+			return 0, ui.Reported(err)
+		}
+		u.Step(out.Text, "")
+		return n, nil
+	}
+
+	var n int
+	var err error
+	spinErr := u.Spin("Sign in to Pressable in your browser", "Opening the browser…", nil, func(set func(string)) ui.Outcome {
+		lo.OnAuthorizeURL = func(url string, opened bool) {
+			if opened {
+				set("Waiting for you to approve access · if the browser didn't open: " + url)
+			} else {
+				set("Open this URL and sign in: " + url)
+			}
+		}
+		var identity string
+		identity, err = h.SignIn(ctx, lo)
+		if err != nil {
+			return ui.Outcome{Level: ui.Fail, Text: err.Error()}
+		}
+		var out ui.Outcome
+		out, n, err = signedIn(identity)
+		return out
 	})
-	return err
+	if spinErr != nil {
+		return 0, spinErr
+	}
+	if err != nil {
+		return 0, ui.Reported(err)
+	}
+	return n, nil
+}
+
+func requireNonEmpty(s string) error {
+	if s == "" {
+		return errors.New("Paste the full URL")
+	}
+	return nil
 }
 
 func orDefault(s, def string) string {
@@ -184,216 +240,22 @@ func orDefault(s, def string) string {
 	return s
 }
 
-func setupSSH(ctx context.Context, w io.Writer, opts Options, cfg *config.Config, deps *mcpserver.Deps, siteCount int) error {
-	fmt.Fprintln(w, "  Step 2 — SSH key for shell, WP-CLI and file access")
-	pair, err := mcsh.EnsureKeyPair(cfg.SSHKeyPath, cfg.SSHKeyLabel)
-	if err != nil {
-		return fmt.Errorf("ensure SSH key: %w", err)
-	}
-	fmt.Fprintf(w, "  ✓ SSH key at %s\n\n", cfg.SSHKeyPath)
-	pub := strings.TrimSpace(pair.PublicKey)
-
-	if opts.Unattended {
-		fmt.Fprintln(w, "  Add this public key in MyPressable → Profile → Settings → SSH Keys")
-		fmt.Fprintf(w, "  (name it %q):\n\n    %s\n\n", cfg.SSHKeyLabel, pub)
-		return nil
-	}
-
-	copied := clipboard.WriteAll(pub) == nil
-	fmt.Fprintln(w, "  Add this public key to your Pressable profile:")
-	fmt.Fprintf(w, "\n    %s\n\n", pub)
-	if copied {
-		fmt.Fprintln(w, "  (Copied to your clipboard.)")
-	}
-	fmt.Fprintln(w, "    1. Open https://my.pressable.com → Profile → Settings → SSH Keys")
-	fmt.Fprintf(w, "    2. Add key — name it %q and paste the key above\n", cfg.SSHKeyLabel)
-	fmt.Fprintln(w, "  Pressable then creates an SSH login for you on every site you have SFTP access to.")
-	fmt.Fprintln(w)
-	if siteCount == 0 {
-		fmt.Fprintln(w, "  · No sites to test against yet — skipping the SSH check.")
-		fmt.Fprintln(w)
-		return nil
-	}
-
-	for {
-		test, err := opts.Prompter.Confirm("Added it? Test SSH access now (choose No to skip)", true)
-		if err != nil {
-			return err
-		}
-		if !test {
-			fmt.Fprintln(w, "  · Skipped. Check later with `presswrench doctor`.")
-			fmt.Fprintln(w)
-			return nil
-		}
-		name, user, err := testSSH(ctx, w, deps)
-		if err == nil {
-			fmt.Fprintf(w, "  ✓ SSH works — logged in to %s as %s\n\n", name, user)
-			return nil
-		}
-		fmt.Fprintf(w, "  ✗ %s\n\n", err)
-	}
-}
-
-// testSSH tries the first few sites, polling briefly: Pressable can take a
-// few seconds to create per-site logins after a key is added.
-func testSSH(ctx context.Context, w io.Writer, deps *mcpserver.Deps) (string, string, error) {
-	list, err := deps.Sites.List(ctx)
-	if err != nil {
-		return "", "", err
-	}
-	if len(list) > 3 {
-		list = list[:3]
-	}
-	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
-		if attempt > 0 {
-			fmt.Fprintln(w, "  … waiting for Pressable to create the SSH logins")
-			time.Sleep(10 * time.Second)
-		}
-		for _, s := range list {
-			name, user, err := deps.CheckSSH(ctx, fmt.Sprint(s.ID))
-			if err == nil {
-				return name, user, nil
-			}
-			lastErr = err
-		}
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no site accepted the key")
-	}
-	return "", "", lastErr
-}
-
-// patchEnv builds the env block for each client's server entry. nil when
-// nothing is set so a plain install has no env block at all.
-func patchEnv(opts Options) map[string]string {
-	env := map[string]string{}
-	if opts.ReadOnly {
-		env["PRESSWRENCH_READ_ONLY"] = "1"
-	}
-	if opts.Account != "" {
-		env["PRESSWRENCH_ACCOUNT"] = opts.Account
-	}
-	if opts.BlockedOperations != nil {
-		env["PRESSWRENCH_BLOCKED_OPERATIONS"] = *opts.BlockedOperations
-	}
-	if len(env) == 0 {
-		return nil
-	}
-	return env
-}
-
-func patchClients(w io.Writer, opts Options) ([]string, error) {
-	all := clients.All(opts.Account)
-	if len(opts.OnlyClients) > 0 {
-		want := map[string]bool{}
-		for _, id := range opts.OnlyClients {
-			want[id] = true
-		}
-		filtered := all[:0]
-		for _, p := range all {
-			if want[p.ID()] {
-				filtered = append(filtered, p)
-			}
-		}
-		all = filtered
-	}
-
-	type detectInfo struct {
-		patcher   clients.Patcher
-		installed bool
-		path      string
-	}
-	infos := make([]detectInfo, 0, len(all))
-	for _, p := range all {
-		installed, path, _ := p.Detect()
-		infos = append(infos, detectInfo{p, installed, path})
-	}
-
-	prompts := make([]SelectOption, 0, len(infos))
-	defaults := []string{}
-	for _, i := range infos {
-		label := i.patcher.DisplayName()
-		if !i.installed {
-			label += " (not detected)"
-		}
-		prompts = append(prompts, SelectOption{Label: label, Value: i.patcher.ID()})
-		if i.installed {
-			defaults = append(defaults, i.patcher.ID())
-		}
-	}
-
-	chosen := defaults
-	if !opts.Unattended {
-		var err error
-		chosen, err = opts.Prompter.MultiSelect("Configure which AI tools?", prompts, defaults)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	want := map[string]bool{}
-	for _, id := range chosen {
-		want[id] = true
-	}
-	patched := []string{}
-	for _, i := range infos {
-		if !want[i.patcher.ID()] {
-			continue
-		}
-		changed, _, err := i.patcher.Patch(opts.BinaryPath, patchEnv(opts), false)
-		if err != nil {
-			fmt.Fprintf(w, "  ✗ %s: %s\n", i.patcher.DisplayName(), err)
-			continue
-		}
-		if changed {
-			fmt.Fprintf(w, "  ✓ %s — patched %s\n", i.patcher.DisplayName(), i.path)
-		} else {
-			fmt.Fprintf(w, "  · %s — already configured\n", i.patcher.DisplayName())
-		}
-		patched = append(patched, i.patcher.ID())
-	}
-	fmt.Fprintln(w)
-	return patched, nil
-}
-
-func printSummary(w io.Writer, opts Options, cfg *config.Config, patched []string) {
-	fmt.Fprintln(w, "  Setup complete.")
-	fmt.Fprintln(w)
-	if opts.Account != "" {
-		fmt.Fprintf(w, "  Account:    %s\n", opts.Account)
-	}
-	fmt.Fprintf(w, "  Entry:      %s\n", clients.EntryName(opts.Account))
-	fmt.Fprintf(w, "  Binary:     %s\n", opts.BinaryPath)
-	if !opts.SkipSSH {
-		fmt.Fprintf(w, "  SSH key:    %s (label %q)\n", cfg.SSHKeyPath, cfg.SSHKeyLabel)
-	}
-	fmt.Fprintf(w, "  MCP server: %s v%s\n", mcpserver.ServerName, mcpserver.ServerVersion)
-	if len(patched) > 0 {
-		fmt.Fprintf(w, "  Configured: %s\n", strings.Join(patched, ", "))
-		fmt.Fprintln(w)
-		fmt.Fprintln(w, "  Restart your AI tool to load the server.")
-	}
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "  Verify with:  presswrench doctor")
-	fmt.Fprintln(w)
-}
-
 // WarnOfficial prints a notice when an AI tool also has Pressable's hosted
 // MCP server configured: with both loaded, the model can reach Pressable
 // directly and skip read-only mode and the operation blocklist. Reports
 // whether anything was found.
-func WarnOfficial(w io.Writer) bool {
-	found := clients.FindOfficial()
+func WarnOfficial(u *ui.UI) bool {
+	return warnOfficial(u, clients.FindOfficial())
+}
+
+func warnOfficial(u *ui.UI, found []clients.OfficialEntry) bool {
 	if len(found) == 0 {
 		return false
 	}
-	fmt.Fprintf(w, "  ! Pressable's official MCP server (%s) is also configured:\n", clients.OfficialHost)
+	u.Warn(fmt.Sprintf("Pressable's official MCP server (%s) is also configured", clients.OfficialHost), "")
 	for _, e := range found {
-		fmt.Fprintf(w, "      %s — %s  (%s)\n", e.Client, e.Name, e.Path)
+		u.Note(fmt.Sprintf("%s — %s  (%s)", e.Client, e.Name, e.Path))
 	}
-	fmt.Fprintln(w, "    With both loaded, the AI can call Pressable directly, bypassing presswrench's")
-	fmt.Fprintln(w, "    read-only mode and blocked operations. Remove that entry if you rely on them.")
-	fmt.Fprintln(w)
+	u.Note("With both loaded the AI can bypass read-only mode and blocked operations. Remove that entry if you rely on them.")
 	return true
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/februality/presswrench/internal/creds"
 	"github.com/februality/presswrench/internal/mcpserver"
 	mcsh "github.com/februality/presswrench/internal/ssh"
+	"github.com/februality/presswrench/internal/ui"
 	"github.com/februality/presswrench/internal/wizard"
 )
 
@@ -51,7 +52,7 @@ func runDoctor(site string) error {
 		}
 		fmt.Println()
 	}
-	wizard.WarnOfficial(os.Stdout)
+	wizard.WarnOfficial(ui.New(os.Stdout, os.Stdin))
 	if firstErr == nil {
 		fmt.Println("All checks complete.")
 	}
