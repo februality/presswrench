@@ -120,6 +120,18 @@ func runSteps(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h
 	}
 
 	var patched []string
+	if !opts.SkipClients {
+		if !opts.Unattended {
+			ro, err := readOnlyStep(u, opts)
+			if err != nil {
+				return err
+			}
+			opts.ReadOnly = ro
+		}
+		if patched, err = patchClients(u, opts, h); err != nil {
+			return err
+		}
+	}
 	warnOfficial(u, h.Official())
 	u.Blank()
 	if len(patched) > 0 {
@@ -336,6 +348,107 @@ func pollSSH(ctx context.Context, h *Hooks, set func(string)) (string, string, e
 	return "", "", lastErr
 }
 
+// readOnlyStep asks whether to bake read-only mode into the client configs.
+// The prompt's own finished line is the record; nothing else is printed.
+func readOnlyStep(u *ui.UI, opts Options) (bool, error) {
+	u.Note("Hides shell, WP-CLI and file writes; allows only read-only Pressable calls.")
+	return opts.Prompter.Confirm("Run in read-only mode?", opts.ReadOnly)
+}
+
+// patchEnv builds the env block for each client's server entry. nil when
+// nothing is set so a plain install has no env block at all.
+func patchEnv(opts Options) map[string]string {
+	env := map[string]string{}
+	if opts.ReadOnly {
+		env["PRESSWRENCH_READ_ONLY"] = "1"
+	}
+	if opts.Account != "" {
+		env["PRESSWRENCH_ACCOUNT"] = opts.Account
+	}
+	if opts.BlockedOperations != nil {
+		env["PRESSWRENCH_BLOCKED_OPERATIONS"] = *opts.BlockedOperations
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
+}
+
+// patchClients asks which AI tools to configure (detected ones
+// pre-selected) and patches each. Patch failures are reported per client
+// and don't stop the run. Returns the IDs that were configured.
+func patchClients(u *ui.UI, opts Options, h *Hooks) ([]string, error) {
+	all := h.Patchers(opts.Account)
+	if len(opts.OnlyClients) > 0 {
+		want := map[string]bool{}
+		for _, id := range opts.OnlyClients {
+			want[id] = true
+		}
+		filtered := make([]clients.Patcher, 0, len(all))
+		for _, p := range all {
+			if want[p.ID()] {
+				filtered = append(filtered, p)
+			}
+		}
+		all = filtered
+	}
+
+	type detectInfo struct {
+		patcher   clients.Patcher
+		installed bool
+		path      string
+	}
+	infos := make([]detectInfo, 0, len(all))
+	options := make([]ui.Option, 0, len(all))
+	defaults := []string{}
+	for _, p := range all {
+		installed, path, _ := p.Detect()
+		infos = append(infos, detectInfo{p, installed, path})
+		opt := ui.Option{Label: p.DisplayName(), Value: p.ID()}
+		if installed {
+			defaults = append(defaults, p.ID())
+		} else {
+			opt.Hint = "(not detected)"
+			opt.Dim = true
+		}
+		options = append(options, opt)
+	}
+
+	chosen := defaults
+	if !opts.Unattended {
+		var err error
+		if chosen, err = opts.Prompter.MultiSelect("Configure which AI tools?", options, defaults); err != nil {
+			return nil, err
+		}
+	}
+	want := map[string]bool{}
+	for _, id := range chosen {
+		want[id] = true
+	}
+
+	patched := []string{}
+	for _, i := range infos {
+		if !want[i.patcher.ID()] {
+			continue
+		}
+		changed, _, err := i.patcher.Patch(opts.BinaryPath, patchEnv(opts), false)
+		if err != nil {
+			u.Fail(i.patcher.DisplayName(), err.Error())
+			continue
+		}
+		if changed {
+			u.Step(i.patcher.DisplayName(), shortHome(i.path))
+		} else {
+			u.Step(i.patcher.DisplayName(), "already configured")
+		}
+		patched = append(patched, i.patcher.ID())
+	}
+	if len(chosen) == 0 {
+		u.Step("AI tools", "none configured")
+	}
+	return patched, nil
+}
+
 // shortHome abbreviates the user's home directory to "~" for display.
 func shortHome(p string) string {
 	home, err := os.UserHomeDir()
@@ -373,7 +486,7 @@ func warnOfficial(u *ui.UI, found []clients.OfficialEntry) bool {
 	}
 	u.Warn(fmt.Sprintf("Pressable's official MCP server (%s) is also configured", clients.OfficialHost), "")
 	for _, e := range found {
-		u.Note(fmt.Sprintf("%s — %s  (%s)", e.Client, e.Name, e.Path))
+		u.NoteRaw(fmt.Sprintf("%s — %s  (%s)", e.Client, e.Name, e.Path))
 	}
 	u.Note("With both loaded the AI can bypass read-only mode and blocked operations. Remove that entry if you rely on them.")
 	return true
