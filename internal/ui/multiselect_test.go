@@ -4,9 +4,11 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/muesli/termenv"
 )
 
 var toolOptions = []Option{
@@ -88,5 +90,27 @@ func TestMultiSelect_EmptyDoesNotPanic(t *testing.T) {
 	m = upd(m, key(tea.KeyDown), key(tea.KeySpace), key(tea.KeyUp), runes("a"), key(tea.KeyEnter)).(multiSelectModel)
 	if !m.done || len(m.values()) != 0 {
 		t.Fatalf("done=%v values=%v", m.done, m.values())
+	}
+}
+
+// A ticked box must read as ticked on every row, so the state is carried
+// by colour (green on, dim off) and never by the focus highlight, which
+// hides the glyph shape.
+func TestMultiSelect_TickStateIsColourNotFocus(t *testing.T) {
+	u := NewTest(io.Discard, true, true, 80)
+	u.r.SetColorProfile(termenv.ANSI)
+	u.st = newStyles(u.r)
+	v := tools(u).View()
+	if strings.Contains(v, "\x1b[46m") {
+		t.Fatalf("checkbox uses a background highlight: %q", v)
+	}
+	if !strings.Contains(v, "\x1b[32m◼") {
+		t.Fatalf("ticked box on the focused row is not green: %q", v)
+	}
+	if strings.Count(v, "\x1b[32m◼") != 2 {
+		t.Fatalf("every ticked box should be green: %q", v)
+	}
+	if !strings.Contains(v, "\x1b[90m◻") {
+		t.Fatalf("unticked box is not dim: %q", v)
 	}
 }

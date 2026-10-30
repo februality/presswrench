@@ -135,9 +135,12 @@ func (m multiSelectModel) View() string {
 	b.WriteString(u.activeHeader(m.title))
 	pad := strings.Repeat(" ", len([]rune(u.g.cursor)))
 	for i, o := range m.opts {
-		box := u.g.checkOff
+		// The tick state is carried by colour on every row (green on, dim
+		// off); focus is the cursor and a bold label, never a highlight on
+		// the box, which would hide its shape.
+		box := u.st.dim.Render(u.g.checkOff)
 		if m.checked[i] {
-			box = u.g.checkOn
+			box = u.st.done.Render(u.g.checkOn)
 		}
 		label := o.Label
 		if o.Dim {
@@ -148,9 +151,9 @@ func (m multiSelectModel) View() string {
 		}
 		var row string
 		if i == m.cursor {
-			row = u.st.active.Render(u.g.cursor) + " " + u.st.focus.Render(box) + " " + label
+			row = u.st.active.Render(u.g.cursor) + " " + box + " " + u.st.bold.Render(label)
 		} else {
-			row = pad + " " + u.st.dim.Render(box) + " " + label
+			row = pad + " " + box + " " + label
 		}
 		b.WriteString(u.railLine(row))
 	}
