@@ -27,3 +27,6 @@ coverage.html
 
 # Defensive: file-fallback creds shape used by internal/creds/filestore.go
 credentials.json
+
+# Brainstorm mockups (superpowers visual companion)
+.superpowers/
