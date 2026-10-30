@@ -16,6 +16,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/clients"
@@ -110,7 +113,11 @@ func runSteps(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h
 	if err != nil {
 		return err
 	}
-	_ = siteCount
+	if !opts.SkipSSH {
+		if err := setupSSH(ctx, u, opts, cfg, h, siteCount); err != nil {
+			return err
+		}
+	}
 
 	var patched []string
 	warnOfficial(u, h.Official())
@@ -224,6 +231,118 @@ func signIn(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *
 		return 0, ui.Reported(err)
 	}
 	return n, nil
+}
+
+const (
+	sshPollAttempts = 4
+	sshPollSites    = 3
+)
+
+// setupSSH creates the key pair, tells the user how to add it in
+// MyPressable, and offers to test the login until it works or they skip.
+func setupSSH(ctx context.Context, u *ui.UI, opts Options, cfg *config.Config, h *Hooks, siteCount int) error {
+	pair, err := h.EnsureKey(cfg.SSHKeyPath, cfg.SSHKeyLabel)
+	if err != nil {
+		return fail(u, fmt.Errorf("Create SSH key: %w", err))
+	}
+	pub := strings.TrimSpace(pair.PublicKey)
+	copied := h.Clipboard(pub) == nil
+	detail := shortHome(cfg.SSHKeyPath)
+	if copied {
+		detail += " · copied to clipboard"
+	}
+	u.Step("SSH key", detail)
+
+	instructions := fmt.Sprintf("Add it in MyPressable → Profile → Settings → SSH Keys, named %q.", cfg.SSHKeyLabel)
+	if opts.Unattended {
+		u.NoteRaw(pub)
+		u.Note(instructions)
+		return nil
+	}
+	u.Note(instructions)
+	if !copied {
+		u.NoteRaw(pub)
+	}
+	u.Blank()
+
+	if siteCount == 0 {
+		u.Step("SSH test", "no sites to test against yet")
+		return nil
+	}
+
+	options := []ui.Option{{Label: "Test SSH now", Value: "test"}}
+	if copied {
+		options = append(options, ui.Option{Label: "Show the key", Value: "show"})
+	}
+	options = append(options, ui.Option{Label: "Skip", Value: "skip"})
+
+	for {
+		choice, err := opts.Prompter.Select("Added the key?", options, "test")
+		if err != nil {
+			return err
+		}
+		switch choice {
+		case "show":
+			u.NoteRaw(pub)
+		case "skip":
+			u.Step("SSH test", "skipped, check later with presswrench doctor")
+			return nil
+		default:
+			var ok bool
+			if err := u.Spin("Checking SSH access", "attempt 1 of 4", nil, func(set func(string)) ui.Outcome {
+				name, user, err := pollSSH(ctx, h, set)
+				if err != nil {
+					return ui.Outcome{Level: ui.Warn, Text: "SSH not working yet · " + err.Error()}
+				}
+				ok = true
+				return ui.Outcome{Level: ui.Done, Text: fmt.Sprintf("SSH works · %s as %s", name, user)}
+			}); err != nil {
+				return err
+			}
+			if ok {
+				return nil
+			}
+		}
+	}
+}
+
+// pollSSH tries the first few sites, polling briefly: Pressable can take
+// a few seconds to create per-site logins after a key is added.
+func pollSSH(ctx context.Context, h *Hooks, set func(string)) (string, string, error) {
+	list, err := h.ListSites(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	if len(list) > sshPollSites {
+		list = list[:sshPollSites]
+	}
+	var lastErr error
+	for attempt := 1; attempt <= sshPollAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(h.PollDelay)
+		}
+		set(fmt.Sprintf("attempt %d of %d", attempt, sshPollAttempts))
+		for _, s := range list {
+			name, user, err := h.CheckSSH(ctx, fmt.Sprint(s.ID))
+			if err == nil {
+				return name, user, nil
+			}
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no site accepted the key")
+	}
+	return "", "", lastErr
+}
+
+// shortHome abbreviates the user's home directory to "~" for display.
+func shortHome(p string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || !strings.HasPrefix(p, home) {
+		return p
+	}
+	return "~" + filepath.ToSlash(strings.TrimPrefix(p, home))
 }
 
 func requireNonEmpty(s string) error {

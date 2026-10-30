@@ -231,3 +231,121 @@ func TestRun_AccountNote(t *testing.T) {
 		t.Fatalf("output:\n%s", r.out)
 	}
 }
+
+// --- SSH step ---
+
+func sshHooks(check func(context.Context, string) (string, string, error)) *Hooks {
+	h := fakeHooks()
+	h.CheckSSH = check
+	return h
+}
+
+func optionValues(opts []ui.Option) []string {
+	out := []string{}
+	for _, o := range opts {
+		out = append(out, o.Value)
+	}
+	return out
+}
+
+func TestSSHStep_ClipboardWorks(t *testing.T) {
+	p := &scriptedPrompter{selects: []string{"skip"}}
+	r := run(t, true, Options{SkipClients: true}, fakeHooks(), p)
+	if r.err != nil {
+		t.Fatalf("err %v", r.err)
+	}
+	if !strings.Contains(r.out, "◇  SSH key · ~/.ssh/presswrench · copied to clipboard\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	if strings.Contains(r.out, "ssh-ed25519 AAAA") {
+		t.Fatalf("key must not be printed when copied:\n%s", r.out)
+	}
+	if got := strings.Join(optionValues(p.selectOpts[0]), ","); got != "test,show,skip" {
+		t.Fatalf("options %s", got)
+	}
+	if !strings.Contains(r.out, "◇  SSH test · skipped, check later with presswrench doctor\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+}
+
+func TestSSHStep_ClipboardFails(t *testing.T) {
+	h := fakeHooks()
+	h.Clipboard = func(string) error { return errors.New("no clipboard") }
+	p := &scriptedPrompter{selects: []string{"skip"}}
+	r := run(t, true, Options{SkipClients: true}, h, p)
+	if !strings.Contains(r.out, "◇  SSH key · ~/.ssh/presswrench\n") || !strings.Contains(r.out, "│  ssh-ed25519 AAAA test\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	if got := strings.Join(optionValues(p.selectOpts[0]), ","); got != "test,skip" {
+		t.Fatalf("options %s", got)
+	}
+}
+
+func TestSSHStep_ShowKeyThenTest(t *testing.T) {
+	h := sshHooks(func(context.Context, string) (string, string, error) { return "mysite", "u1", nil })
+	p := &scriptedPrompter{selects: []string{"show", "test"}}
+	r := run(t, true, Options{SkipClients: true}, h, p)
+	if r.err != nil {
+		t.Fatalf("err %v", r.err)
+	}
+	if strings.Count(r.out, "│  ssh-ed25519 AAAA test\n") != 1 {
+		t.Fatalf("key should be shown exactly once:\n%s", r.out)
+	}
+	if !strings.Contains(r.out, "◆  Checking SSH access\n◇  SSH works · mysite as u1\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	if len(p.selectOpts) != 2 {
+		t.Fatalf("select calls %d", len(p.selectOpts))
+	}
+}
+
+func TestSSHStep_TestFailsThenSkip(t *testing.T) {
+	calls := 0
+	h := sshHooks(func(context.Context, string) (string, string, error) { calls++; return "", "", errors.New("denied") })
+	p := &scriptedPrompter{selects: []string{"test", "skip"}}
+	r := run(t, true, Options{SkipClients: true}, h, p)
+	if r.err != nil {
+		t.Fatalf("err %v", r.err)
+	}
+	if !strings.Contains(r.out, "▲  SSH not working yet · denied\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	if !strings.Contains(r.out, "◇  SSH test · skipped, check later with presswrench doctor\n") {
+		t.Fatalf("output:\n%s", r.out)
+	}
+	if calls != 12 {
+		t.Fatalf("CheckSSH called %d times, want 12 (3 sites x 4 attempts)", calls)
+	}
+}
+
+func TestSSHStep_NoSites(t *testing.T) {
+	h := fakeHooks()
+	h.ListSites = func(context.Context) ([]sites.Site, error) { return nil, nil }
+	p := &scriptedPrompter{}
+	r := run(t, true, Options{SkipClients: true}, h, p)
+	if !strings.Contains(r.out, "◇  SSH test · no sites to test against yet\n") || len(p.calls) != 0 {
+		t.Fatalf("output:\n%s\ncalls %v", r.out, p.calls)
+	}
+}
+
+func TestSSHStep_Unattended(t *testing.T) {
+	p := &scriptedPrompter{}
+	r := run(t, false, Options{SkipClients: true, Unattended: true}, fakeHooks(), p)
+	if r.err != nil {
+		t.Fatalf("err %v", r.err)
+	}
+	if !strings.Contains(r.out, "│  ssh-ed25519 AAAA test\n") || len(p.calls) != 0 {
+		t.Fatalf("output:\n%s\ncalls %v", r.out, p.calls)
+	}
+}
+
+func TestSSHStep_Cancel(t *testing.T) {
+	p := &scriptedPrompter{err: ui.ErrCancelled}
+	r := run(t, true, Options{SkipClients: true}, fakeHooks(), p)
+	if !ui.IsReported(r.err) || !errors.Is(r.err, ui.ErrCancelled) {
+		t.Fatalf("err %v", r.err)
+	}
+	if !strings.HasSuffix(r.out, "└\n") {
+		t.Fatalf("output should end with the bare outro:\n%s", r.out)
+	}
+}
