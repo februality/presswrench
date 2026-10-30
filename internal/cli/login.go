@@ -42,8 +42,17 @@ func NewLogin() *cobra.Command {
 				AuthURL:     cfg.AuthURL,
 				OpenBrowser: auth.OpenBrowser,
 				Manual:      manual,
-				ReadLine:    func() (string, error) { return reader.ReadString('\n') },
-				Out:         os.Stdout,
+				ReadLine: func() (string, error) {
+					fmt.Print("  Paste the URL your browser landed on: ")
+					return reader.ReadString('\n')
+				},
+				OnAuthorizeURL: func(u string, opened bool) {
+					if opened {
+						fmt.Printf("  Opened your browser to sign in. If nothing appeared, open:\n\n    %s\n\n", u)
+					} else {
+						fmt.Printf("  Open this URL in a browser and sign in to Pressable:\n\n    %s\n\n", u)
+					}
+				},
 			})
 			if err != nil {
 				return err

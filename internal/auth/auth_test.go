@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -194,13 +195,13 @@ func TestLogin_ManualPaste(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Capture the authorize URL from the printed output, follow it without
-	// a listener, and paste the final redirect URL back.
-	var out strings.Builder
+	// Capture the authorize URL from the callback, follow it without a
+	// listener, and paste the final redirect URL back.
+	var authURL string
 	readLine := func() (string, error) {
-		s := out.String()
-		i := strings.Index(s, srv.URL+"/auth/authorize")
-		authURL := strings.Fields(s[i:])[0]
+		if !strings.HasPrefix(authURL, srv.URL+"/auth/authorize") {
+			return "", fmt.Errorf("OnAuthorizeURL not called before ReadLine (got %q)", authURL)
+		}
 		client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		resp, err := client.Get(authURL)
 		if err != nil {
@@ -209,7 +210,10 @@ func TestLogin_ManualPaste(t *testing.T) {
 		resp.Body.Close()
 		return resp.Header.Get("Location") + "\n", nil
 	}
-	tr, err := Login(context.Background(), LoginOptions{AuthURL: srv.URL, ClientID: clientID, Manual: true, ReadLine: readLine, Out: &out})
+	tr, err := Login(context.Background(), LoginOptions{
+		AuthURL: srv.URL, ClientID: clientID, Manual: true, ReadLine: readLine,
+		OnAuthorizeURL: func(u string, _ bool) { authURL = u },
+	})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -381,5 +385,36 @@ func TestCallback_IgnoresForeignState(t *testing.T) {
 	q, err := waitForCallback(context.Background(), ln, "good", 5*time.Second)
 	if err != nil || q.Get("code") != "c" {
 		t.Fatalf("q = %v, err = %v", q, err)
+	}
+}
+
+func TestLogin_ReportsBrowserOpened(t *testing.T) {
+	_, srv := newFakeAS(t)
+	clientID, err := Register(context.Background(), nil, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		open func(string) error
+		want bool
+	}{
+		{"opened", browserFollow, true},
+		{"failed", func(u string) error { _ = browserFollow(u); return errors.New("no browser") }, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var gotURL string
+			var gotOpened bool
+			_, err := Login(context.Background(), LoginOptions{
+				AuthURL: srv.URL, ClientID: clientID, OpenBrowser: c.open, Timeout: 10 * time.Second,
+				OnAuthorizeURL: func(u string, opened bool) { gotURL, gotOpened = u, opened },
+			})
+			if err != nil {
+				t.Fatalf("Login: %v", err)
+			}
+			if !strings.HasPrefix(gotURL, srv.URL+"/auth/authorize") || gotOpened != c.want {
+				t.Fatalf("url=%q opened=%v want %v", gotURL, gotOpened, c.want)
+			}
+		})
 	}
 }

@@ -170,7 +170,9 @@ func ensureSignedIn(ctx context.Context, w io.Writer, opts Options, cfg *config.
 		OpenBrowser: auth.OpenBrowser,
 		Manual:      opts.ManualLogin,
 		ReadLine:    func() (string, error) { return reader.ReadString('\n') },
-		Out:         w,
+		OnAuthorizeURL: func(u string, _ bool) {
+			fmt.Fprintf(w, "  Open this URL if your browser didn't:\n\n    %s\n\n", u)
+		},
 	})
 	return err
 }

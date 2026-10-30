@@ -141,18 +141,18 @@ type LoginOptions struct {
 	// Manual skips the loopback listener: the user pastes the URL their
 	// browser was redirected to. For machines the browser can't reach.
 	Manual bool
-	// ReadLine reads the pasted redirect URL in Manual mode.
+	// ReadLine reads the pasted redirect URL in Manual mode. The caller
+	// prompts; Login prints nothing.
 	ReadLine func() (string, error)
-	Out      io.Writer
-	Timeout  time.Duration
-	HTTP     *http.Client
+	// OnAuthorizeURL, when set, receives the authorize URL right after the
+	// browser was (or wasn't) opened, before Login waits for the callback.
+	OnAuthorizeURL func(url string, browserOpened bool)
+	Timeout        time.Duration
+	HTTP           *http.Client
 }
 
 // Login runs the authorization-code + PKCE flow and returns the tokens.
 func Login(ctx context.Context, o LoginOptions) (*TokenResponse, error) {
-	if o.Out == nil {
-		o.Out = io.Discard
-	}
 	if o.Timeout == 0 {
 		o.Timeout = 5 * time.Minute
 	}
@@ -191,10 +191,8 @@ func Login(ctx context.Context, o LoginOptions) (*TokenResponse, error) {
 	if o.OpenBrowser != nil && !o.Manual {
 		opened = o.OpenBrowser(authorizeURL) == nil
 	}
-	if opened {
-		fmt.Fprintf(o.Out, "  Opened your browser to sign in to Pressable. If nothing appeared, open:\n\n    %s\n\n", authorizeURL)
-	} else {
-		fmt.Fprintf(o.Out, "  Open this URL in a browser and sign in to Pressable:\n\n    %s\n\n", authorizeURL)
+	if o.OnAuthorizeURL != nil {
+		o.OnAuthorizeURL(authorizeURL, opened)
 	}
 
 	var params url.Values
@@ -202,8 +200,6 @@ func Login(ctx context.Context, o LoginOptions) (*TokenResponse, error) {
 		if o.ReadLine == nil {
 			return nil, errors.New("manual login needs a line reader")
 		}
-		fmt.Fprintln(o.Out, "  After approving, your browser lands on a 127.0.0.1 page that fails to load.")
-		fmt.Fprint(o.Out, "  Paste that page's full URL here: ")
 		line, err := o.ReadLine()
 		if err != nil {
 			return nil, err
