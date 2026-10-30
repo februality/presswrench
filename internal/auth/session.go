@@ -16,8 +16,8 @@ import (
 // so a request never races the expiry.
 const refreshMargin = 2 * time.Minute
 
-// EnvAccessToken, when set, is used verbatim as the bearer token and the
-// stored session is ignored. No refresh happens.
+// EnvAccessToken names the env var whose value, when set, is used verbatim
+// as the bearer token and the stored session is ignored. No refresh happens.
 const EnvAccessToken = "PRESSWRENCH_ACCESS_TOKEN"
 
 // Session hands out valid access tokens for one account, refreshing and

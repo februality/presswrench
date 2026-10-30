@@ -12,6 +12,7 @@ linters:
         - fmt.Fprintf
         - fmt.Fprintln
         - (io.Closer).Close
+        - (net.Listener).Close
         - (*net/http.Response).Body.Close
         - (*golang.org/x/crypto/ssh.Session).Close
         - (*golang.org/x/crypto/ssh.Client).Close

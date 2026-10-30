@@ -58,17 +58,6 @@ func accountKey(account, attr string) string {
 	return account + ":" + attr
 }
 
-// isSessionAttr reports whether attr is one of ours. Used to recognise
-// account names when enumerating backend keys.
-func isSessionAttr(attr string) bool {
-	for _, k := range SessionKeys {
-		if k == attr {
-			return true
-		}
-	}
-	return false
-}
-
 // Store is the persistence backend.
 type Store interface {
 	GetFor(account, attr string) (string, error)

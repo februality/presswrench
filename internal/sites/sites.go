@@ -214,10 +214,10 @@ func FTPAccounts(ctx context.Context, exec Executor, siteID int64) ([]FTPAccount
 func KeyCandidates(accounts []FTPAccount, label, email string) []string {
 	var mine, others []FTPAccount
 	for _, a := range accounts {
-		switch {
-		case a.SSHKeyLabel == "":
+		switch a.SSHKeyLabel {
+		case "":
 			continue
-		case a.SSHKeyLabel == label:
+		case label:
 			mine = append(mine, a)
 		default:
 			others = append(others, a)
