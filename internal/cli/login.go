@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/config"
 	"github.com/februality/presswrench/internal/creds"
+	"github.com/februality/presswrench/internal/ui"
 )
 
 func NewLogin() *cobra.Command {
@@ -37,33 +39,84 @@ func NewLogin() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("open credentials store: %w", err)
 			}
-			reader := bufio.NewReader(os.Stdin)
-			tr, err := auth.SignIn(context.Background(), store, account, auth.LoginOptions{
-				AuthURL:     cfg.AuthURL,
-				OpenBrowser: auth.OpenBrowser,
-				Manual:      manual,
-				ReadLine: func() (string, error) {
-					fmt.Print("  Paste the URL your browser landed on: ")
-					return reader.ReadString('\n')
-				},
-				OnAuthorizeURL: func(u string, opened bool) {
-					if opened {
-						fmt.Printf("  Opened your browser to sign in. If nothing appeared, open:\n\n    %s\n\n", u)
-					} else {
-						fmt.Printf("  Open this URL in a browser and sign in to Pressable:\n\n    %s\n\n", u)
-					}
-				},
-			})
-			if err != nil {
-				return err
-			}
-			fmt.Printf("  ✓ Signed in as %s (account: %s)\n", orUnknown(tr.Identity()), accountLabel(account))
-			return nil
+			return runLogin(ui.New(os.Stdout, os.Stdin), store, cfg, account, manual)
 		},
 	}
 	cmd.Flags().StringVar(&account, "account", "", "named account (lowercase slug); omit for the default")
 	cmd.Flags().BoolVar(&manual, "manual", false, "paste the redirect URL instead of using a local callback listener")
 	return cmd
+}
+
+// runLogin signs in and prints one "Signed in as …" line. In a terminal
+// the browser wait is a spinner; with --manual or without a terminal the
+// URL is printed and the redirect URL is read from the prompt or stdin.
+func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, manual bool) error {
+	ctx := context.Background()
+	lo := auth.LoginOptions{
+		AuthURL:     cfg.AuthURL,
+		OpenBrowser: auth.OpenBrowser,
+		Manual:      manual,
+	}
+	detail := "account " + accountLabel(account)
+
+	if manual || !u.Interactive() {
+		lo.OnAuthorizeURL = func(url string, opened bool) {
+			if opened {
+				u.NoteRaw("Opened your browser to sign in. If nothing appeared, open:", url)
+			} else {
+				u.NoteRaw("Open this URL and sign in to Pressable:", url)
+			}
+		}
+		if manual {
+			u.Note("After approving, your browser lands on a 127.0.0.1 page that fails to load.")
+			reader := bufio.NewReader(os.Stdin)
+			lo.ReadLine = func() (string, error) { return reader.ReadString('\n') }
+			if u.Interactive() {
+				lo.ReadLine = func() (string, error) {
+					return u.Text("Paste the URL your browser landed on", "http://127.0.0.1:53682/callback?…", func(s string) error {
+						if s == "" {
+							return errors.New("Paste the full URL")
+						}
+						return nil
+					})
+				}
+			}
+		}
+		tr, err := auth.SignIn(ctx, store, account, lo)
+		if err != nil {
+			if errors.Is(err, ui.ErrCancelled) {
+				return err
+			}
+			u.Fail(err.Error(), "")
+			return ui.Reported(err)
+		}
+		u.Step("Signed in as "+orUnknown(tr.Identity()), detail)
+		return nil
+	}
+
+	var signErr error
+	err := u.Spin("Sign in to Pressable in your browser", "Opening the browser…", nil, func(set func(string)) ui.Outcome {
+		lo.OnAuthorizeURL = func(url string, opened bool) {
+			if opened {
+				set("Waiting for you to approve access · if the browser didn't open: " + url)
+			} else {
+				set("Open this URL and sign in: " + url)
+			}
+		}
+		tr, err := auth.SignIn(ctx, store, account, lo)
+		if err != nil {
+			signErr = err
+			return ui.Outcome{Level: ui.Fail, Text: err.Error()}
+		}
+		return ui.Outcome{Level: ui.Done, Text: "Signed in as " + orUnknown(tr.Identity()) + " · " + detail}
+	})
+	if err != nil {
+		return err
+	}
+	if signErr != nil {
+		return ui.Reported(signErr)
+	}
+	return nil
 }
 
 func NewLogout() *cobra.Command {
@@ -86,11 +139,11 @@ func NewLogout() *cobra.Command {
 			if err := auth.SignOut(context.Background(), store, account, cfg.AuthURL); err != nil {
 				return err
 			}
-			fmt.Printf("  ✓ Signed out (account: %s)\n", accountLabel(account))
+			ui.New(os.Stdout, os.Stdin).Step("Signed out", "account "+accountLabel(account))
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&account, "account", "", "named account; omit for the default")
+	cmd.Flags().StringVar(&account, "account", "", "named account (lowercase slug); omit for the default")
 	return cmd
 }
 
