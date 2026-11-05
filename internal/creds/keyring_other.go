@@ -1,9 +1,9 @@
+//go:build !darwin
+
 package creds
 
 import (
 	"errors"
-	"sort"
-	"strings"
 
 	"github.com/99designs/keyring"
 )
@@ -79,21 +79,3 @@ func (k *keyringStore) Backend() Source { return SourceKeyring }
 
 // accountsFromKeys derives account names from raw backend keys: an account
 // counts when it has a refresh token stored.
-func accountsFromKeys(keys []string) []string {
-	seen := map[string]struct{}{}
-	for _, key := range keys {
-		account, attr := DefaultAccount, key
-		if idx := strings.LastIndex(key, ":"); idx >= 1 {
-			account, attr = key[:idx], key[idx+1:]
-		}
-		if attr == KeyRefreshToken {
-			seen[account] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}

@@ -4,8 +4,11 @@
 //
 // Backends, in order of preference:
 //
-//  1. OS keychain (macOS Keychain, Windows Credential Manager, Linux
-//     Secret Service) via github.com/99designs/keyring.
+//  1. OS keychain. macOS: the login keychain via /usr/bin/security
+//     (github.com/zalando/go-keyring), so the item's ACL trusts Apple's
+//     stably signed tool rather than our ad-hoc signed binary, whose cdhash
+//     changes on every build and re-triggers the keychain prompt. Windows
+//     Credential Manager / Linux Secret Service: github.com/99designs/keyring.
 //  2. File fallback at <user config dir>/presswrench/credentials.json
 //     (mode 0600) for headless Linux / WSL / Docker.
 //
@@ -19,6 +22,8 @@ package creds
 
 import (
 	"errors"
+	"sort"
+	"strings"
 )
 
 const (
@@ -101,4 +106,25 @@ func DeleteSession(store Store, account string) error {
 		}
 	}
 	return firstErr
+}
+
+// accountsFromKeys derives account names from storage keys: an account
+// exists when its refresh token does.
+func accountsFromKeys(keys []string) []string {
+	seen := map[string]struct{}{}
+	for _, key := range keys {
+		account, attr := DefaultAccount, key
+		if idx := strings.LastIndex(key, ":"); idx >= 1 {
+			account, attr = key[:idx], key[idx+1:]
+		}
+		if attr == KeyRefreshToken {
+			seen[account] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
