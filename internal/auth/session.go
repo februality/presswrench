@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -46,10 +47,11 @@ type Session struct {
 
 	// A refreshed session that couldn't be saved (see persist). While
 	// pending != nil this process holds the account lock in held (unless a
-	// user command took it over; see flushOnce), and spent is the refresh
-	// token it exchanged (what the store still holds).
+	// user command took it over; see flushOnce), and spent lists every
+	// refresh token it exchanged since: the store holding any of them (a
+	// save that wrote the record, then failed) still holds our session.
 	pending  *creds.Record
-	spent    string
+	spent    []string
 	held     *lockfile.Lock
 	reason   string      // held's lock reason
 	retry    *time.Timer // background save retry
@@ -152,8 +154,10 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 		}
 		if s.pending != nil && !s.held.Held() {
 			// A user command took the lock: settle before spending a
-			// refresh token (which a partial save may have stored).
-			s.flushUnlocked(ctx)
+			// refresh token (which a partial save may have stored). Not
+			// under the request's ctx: a cancelled request must not make
+			// the settle give up and discard the session.
+			s.flushUnlocked(context.WithoutCancel(ctx))
 			if s.closed {
 				return "", errSessionClosed
 			}
@@ -167,10 +171,15 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 		}
 	}
 
-	// Another process may have refreshed already.
-	if tok, exp, ok := s.loadStoredAccess(); ok && tok != s.bad && now.Before(exp.Add(-refreshMargin)) {
-		s.access, s.expiry = tok, exp
-		return tok, nil
+	// Another process may have refreshed already. A store error other than
+	// "no record" ends the call here, before the account lock: a locked or
+	// waiting keychain costs one call (and one dialog), not three.
+	stored, err := s.loadStored()
+	if err != nil {
+		return "", err
+	}
+	if s.adoptStoredLocked(stored, now) {
+		return s.access, nil
 	}
 
 	// Serialize refreshes across processes so two servers never spend the
@@ -197,16 +206,14 @@ func (s *Session) validLocked(now time.Time) bool {
 // lock; keep reports that persist took ownership of it.
 func (s *Session) refreshLocked(ctx context.Context, now time.Time, lock *lockfile.Lock) (tok string, keep bool, err error) {
 	// A sibling may have refreshed while we waited for the lock.
-	if tok, exp, ok := s.loadStoredAccess(); ok && tok != s.bad && now.Before(exp.Add(-refreshMargin)) {
-		s.access, s.expiry = tok, exp
-		return tok, false, nil
-	}
-
-	stored, err := s.store.Load(s.account)
-	if err != nil && creds.KindOf(err) != creds.KindNotFound {
+	stored, err := s.loadStored()
+	if err != nil {
 		return "", false, err
 	}
-	if err != nil || stored.ClientID == "" || stored.RefreshToken == "" {
+	if s.adoptStoredLocked(stored, now) {
+		return s.access, false, nil
+	}
+	if stored.ClientID == "" || stored.RefreshToken == "" {
 		return "", false, &LoginRequiredError{Account: s.account}
 	}
 	clientID, refresh := stored.ClientID, stored.RefreshToken
@@ -215,11 +222,14 @@ func (s *Session) refreshLocked(ctx context.Context, now time.Time, lock *lockfi
 	if errors.As(err, &oe) && oe.Code == "invalid_grant" {
 		// Belt and braces for a process that refreshed without the lock
 		// (an older binary): use whatever it stored.
-		if tok, exp, ok := s.loadStoredAccess(); ok && tok != s.bad && now.Before(exp.Add(-refreshMargin)) {
-			s.access, s.expiry = tok, exp
-			return tok, false, nil
+		again, gerr := s.loadStored()
+		if gerr != nil {
+			return "", false, gerr
 		}
-		if again, gerr := s.store.Load(s.account); gerr == nil && again.RefreshToken != "" && again.RefreshToken != refresh {
+		if s.adoptStoredLocked(again, now) {
+			return s.access, false, nil
+		}
+		if again.RefreshToken != "" && again.RefreshToken != refresh {
 			stored = again
 			tr, err = Refresh(ctx, s.http, s.authURL, clientID, again.RefreshToken)
 		}
@@ -241,7 +251,7 @@ func (s *Session) refreshLocked(ctx context.Context, now time.Time, lock *lockfi
 // A failed save leaves this process the only holder of a rotated session:
 // the record is kept in s.pending and the lock in s.held, with a reason for
 // waiters, so no sibling spends the stale stored refresh token. The save is
-// retried by Token and every pendingRetry. It reports whether it kept the
+// retried in the background every pendingRetry. It reports whether it kept the
 // lock; when it didn't, the caller releases it.
 func (s *Session) persist(ctx context.Context, base creds.Record, tr *TokenResponse, now time.Time, lock *lockfile.Lock) (keep bool) {
 	r := base
@@ -256,7 +266,7 @@ func (s *Session) persist(ctx context.Context, base creds.Record, tr *TokenRespo
 	}
 	slog.Error("Could not save the refreshed Pressable session; keeping it in memory and holding the account lock until it saves",
 		"account", AccountLabel(s.account), "error", Explain(err))
-	s.pending, s.spent, s.held = &r, base.RefreshToken, lock
+	s.pending, s.spent, s.held = &r, []string{base.RefreshToken}, lock
 	s.reason = fmt.Sprintf("%saccount %s: %s Sign in again with `%s` to replace it.",
 		unsavedPrefix, AccountLabel(s.account), sentence(Explain(err)), LoginCommand(s.account))
 	if serr := s.held.SetReason(s.reason); serr != nil {
@@ -301,6 +311,11 @@ func (s *Session) saveWithRetry(ctx context.Context, r creds.Record) error {
 // forward to save it.
 func (s *Session) refreshPendingLocked(ctx context.Context, now time.Time) (string, error) {
 	p := *s.pending
+	// Recorded before the call: once sent, the token may be spent even if
+	// the response is lost.
+	if !slices.Contains(s.spent, p.RefreshToken) {
+		s.spent = append(s.spent, p.RefreshToken)
+	}
 	tr, err := Refresh(ctx, s.http, s.authURL, p.ClientID, p.RefreshToken)
 	var oe *OAuthError
 	if errors.As(err, &oe) && oe.Code == "invalid_grant" {
@@ -345,7 +360,7 @@ const (
 // then failed); a refresh token other than spent means someone wrote a
 // newer session, which is never overwritten; a damaged record is no one's
 // and is overwritten. It returns the lock now held for p.
-func (s *Session) flushOnce(ctx context.Context, p *creds.Record, spent string, held *lockfile.Lock, reason string) (flushResult, *lockfile.Lock) {
+func (s *Session) flushOnce(ctx context.Context, p *creds.Record, spent []string, held *lockfile.Lock, reason string) (flushResult, *lockfile.Lock) {
 	if !held.Held() {
 		held.Release() // stops its heartbeat; never touches the new holder's file
 		l, err := lockAccountWait(ctx, s.account, relockWait, nil)
@@ -362,7 +377,7 @@ func (s *Session) flushOnce(ctx context.Context, p *creds.Record, spent string, 
 	switch {
 	case err == nil && stored.RefreshToken == p.RefreshToken:
 		return flushSaved, held
-	case err == nil && stored.RefreshToken == spent, err != nil && kind == creds.KindCorrupt:
+	case err == nil && slices.Contains(spent, stored.RefreshToken), err != nil && kind == creds.KindCorrupt:
 		// Still ours: save over it.
 	case err == nil, kind == creds.KindNotFound, kind == creds.KindNewerFormat:
 		return flushSuperseded, held
@@ -384,7 +399,7 @@ func (s *Session) flushOnce(ctx context.Context, p *creds.Record, spent string, 
 // doesn't refresh and Close leaves the lock to the settle step, so nothing
 // replaces pending underneath it.
 func (s *Session) flushUnlocked(ctx context.Context) {
-	p, spent, held, reason := s.pending, s.spent, s.held, s.reason
+	p, spent, held, reason := s.pending, slices.Clone(s.spent), s.held, s.reason
 	s.flushing = true
 	s.mu.Unlock()
 	res, lock := s.flushOnce(ctx, p, spent, held, reason)
@@ -433,7 +448,7 @@ func (s *Session) settleFlushLocked(p *creds.Record, res flushResult, lock *lock
 // releases the account lock. In-memory access tokens are left to the
 // caller.
 func (s *Session) dropPendingLocked() {
-	s.pending, s.spent, s.reason = nil, "", ""
+	s.pending, s.spent, s.reason = nil, nil, ""
 	if s.retry != nil {
 		s.retry.Stop()
 		s.retry = nil
@@ -507,14 +522,30 @@ func (s *Session) Invalidate(token string) {
 	}
 }
 
-// loadStoredAccess returns the stored access token and its expiry. A
-// missing expiry reads as the Unix epoch, i.e. expired, so it refreshes.
-func (s *Session) loadStoredAccess() (string, time.Time, bool) {
+// loadStored reads the account's record. No record comes back as an empty
+// record and no error (it holds no session, so callers ask for a login);
+// any other store error is returned for the caller to return at once.
+func (s *Session) loadStored() (creds.Record, error) {
 	r, err := s.store.Load(s.account)
-	if err != nil || r.AccessToken == "" {
-		return "", time.Time{}, false
+	if creds.KindOf(err) == creds.KindNotFound {
+		return creds.Record{}, nil
 	}
-	return r.AccessToken, time.Unix(r.AccessExpiry, 0), true
+	return r, err
+}
+
+// adoptStoredLocked takes r's access token into memory if it is still
+// valid at now (a sibling refreshed) and reports whether it did. A missing
+// expiry reads as the Unix epoch, i.e. expired, so it refreshes.
+func (s *Session) adoptStoredLocked(r creds.Record, now time.Time) bool {
+	if r.AccessToken == "" || r.AccessToken == s.bad {
+		return false
+	}
+	exp := time.Unix(r.AccessExpiry, 0)
+	if !now.Before(exp.Add(-refreshMargin)) {
+		return false
+	}
+	s.access, s.expiry = r.AccessToken, exp
+	return true
 }
 
 // applyTokens copies a token response into r: the refresh token only when

@@ -458,11 +458,18 @@ type faultyStore struct {
 	loadErr   error
 	saveErrs  []error
 	saves     int
+	loads     int
 	deleteErr error
 	saveDelay time.Duration // a slow keychain
 	saveBlock chan struct{} // when set, Save waits until it's closed (a hung keychain)
 
-	mu sync.Mutex // guards loadErr (via setLoadErr), saveErrs, saves, saveDelay
+	mu sync.Mutex // guards loadErr (via setLoadErr), saveErrs, saves, loads, saveDelay
+}
+
+func (f *faultyStore) loadCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loads
 }
 
 func (f *faultyStore) setLoadErr(err error) {
@@ -486,6 +493,7 @@ func (f *faultyStore) Delete(account string) error {
 
 func (f *faultyStore) Load(account string) (creds.Record, error) {
 	f.mu.Lock()
+	f.loads++
 	err := f.loadErr
 	f.mu.Unlock()
 	if err != nil {
@@ -525,6 +533,29 @@ func TestSession_LockedKeychainIsNotLoginRequired(t *testing.T) {
 	}
 	if _, serr := s.State(); creds.KindOf(serr) != creds.KindLocked || errors.Is(serr, ErrLoginRequired) {
 		t.Fatalf("State err = %v", serr)
+	}
+}
+
+// A keychain that times out (an unanswered prompt) must cost one call, not
+// one per step, and must not take the account lock.
+func TestSession_StoreTimeoutFailsFastWithoutLock(t *testing.T) {
+	t.Setenv(EnvAccessToken, "")
+	timeout := &creds.Error{Kind: creds.KindTimeout, Account: "acme", Op: "load"}
+	fs := &faultyStore{Store: newStore(t), loadErr: timeout}
+	inner := lockDir
+	locks := 0
+	lockDir = func() (string, error) { locks++; return inner() }
+	t.Cleanup(func() { lockDir = inner })
+	s := NewSession(fs, "acme", "http://unused")
+	_, err := s.Token(context.Background())
+	if creds.KindOf(err) != creds.KindTimeout || errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("Token err = %v, want the timeout", err)
+	}
+	if n := fs.loadCount(); n != 1 {
+		t.Errorf("loads = %d, want 1", n)
+	}
+	if locks != 0 {
+		t.Errorf("took the account lock %d times for a store error", locks)
 	}
 }
 
@@ -1252,5 +1283,58 @@ func TestSession_TakenOverLockNotRefreshedWithout(t *testing.T) {
 	}
 	if !taker.Held() {
 		t.Error("the taker lost its lock")
+	}
+}
+
+// Settling a lost lock is not the request's business: a cancelled request
+// must not make the session discard what it couldn't save.
+func TestSession_LostLockSettleIgnoresCancelledRequest(t *testing.T) {
+	s, fs, _, _ := pendingSession(t, failSaves(3, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	taker, err := lockAccountForUser(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { time.Sleep(100 * time.Millisecond); taker.Release() }()
+	s.Invalidate(tok)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = s.Token(ctx) // the refresh itself fails: the request is gone
+	if r, _ := fs.Store.Load(""); r.RefreshToken != "refresh-2" {
+		t.Errorf("stored refresh token = %q, want refresh-2 (the unsaved session was discarded)", r.RefreshToken)
+	}
+}
+
+// A save that wrote the record but failed afterwards, then a refresh of the
+// pending session: the store holds a token this session spent, so it is
+// still ours and the next flush saves over it.
+func TestSession_PartialSaveThenPendingRefreshStillSaves(t *testing.T) {
+	s, fs, _, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := fs.Store.Load("")
+	r.RefreshToken, r.AccessToken = "refresh-2", tok
+	if err := fs.Store.Save("", r); err != nil { // the partial save
+		t.Fatal(err)
+	}
+	fs.mu.Lock()
+	fs.saveErrs = nil // the store recovers
+	fs.mu.Unlock()
+	s.Invalidate(tok)
+	again, err := s.Token(context.Background()) // spends refresh-2 for refresh-3
+	if err != nil || again == tok {
+		t.Fatalf("Token = %q, %v", again, err)
+	}
+	runRetry(s)
+	if !eventually(func() bool { return !isPending(s) }) {
+		t.Fatal("still pending")
+	}
+	if r, _ := fs.Store.Load(""); r.RefreshToken != "refresh-3" || r.AccessToken != again {
+		t.Errorf("stored = %q/%q, want refresh-3/%q (a valid session was discarded)", r.RefreshToken, r.AccessToken, again)
 	}
 }
