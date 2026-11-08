@@ -31,11 +31,14 @@ func runServe() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	// Cancelled when serve returns so the startup check never outlives it.
+	// Deferred first so it runs last; the explicit cancel below runs before
+	// Session.Close, which would otherwise wait on the check.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	deps := startServeDeps(ctx, cfg, creds.Open)
+	deps, _ := startServeDeps(ctx, cfg, creds.Open)
 	defer deps.SSHPool.Close()
 	defer deps.Session.Close()
+	defer cancel()
 	return server.ServeStdio(mcpserver.New(deps))
 }
 
@@ -43,10 +46,14 @@ func runServe() error {
 // store that cannot be opened becomes a broken store, so every tool explains
 // the problem in its result instead of the server failing to start.
 func newServeDeps(cfg *config.Config, open func() (creds.Store, error)) *mcpserver.Deps {
-	return startServeDeps(context.Background(), cfg, open)
+	deps, _ := startServeDeps(context.Background(), cfg, open)
+	return deps
 }
 
-func startServeDeps(ctx context.Context, cfg *config.Config, open func() (creds.Store, error)) *mcpserver.Deps {
+// startServeDeps also returns a channel closed when the background session
+// check finishes. The check only inspects the store or env (State): no
+// network, no account lock, no refresh.
+func startServeDeps(ctx context.Context, cfg *config.Config, open func() (creds.Store, error)) (*mcpserver.Deps, <-chan struct{}) {
 	var store creds.Store
 	if os.Getenv(auth.EnvAccessToken) == "" {
 		var err error
@@ -55,10 +62,12 @@ func startServeDeps(ctx context.Context, cfg *config.Config, open func() (creds.
 		}
 	}
 	deps := mcpserver.Build(cfg, store)
-	// Fire-and-forget: log session problems to stderr so they show up in the
-	// client's server log. Tools report them in-chat on their own.
+	done := make(chan struct{})
+	// Background because State's Load can hit a slow keychain. Problems go to
+	// stderr for the client's server log; tools report them in-chat themselves.
 	go func() {
-		if _, err := deps.Session.Token(ctx); err != nil {
+		defer close(done)
+		if _, err := deps.Session.State(); err != nil {
 			if ctx.Err() == nil {
 				slog.Warn("Pressable session problem", "detail", auth.Explain(err))
 			}
@@ -66,5 +75,5 @@ func startServeDeps(ctx context.Context, cfg *config.Config, open func() (creds.
 		}
 		slog.Debug("session ok")
 	}()
-	return deps
+	return deps, done
 }
