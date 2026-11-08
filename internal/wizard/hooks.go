@@ -76,8 +76,10 @@ func DefaultHooks(cfg *config.Config, store creds.Store) *Hooks {
 		Official:  clients.FindOfficial,
 		PollDelay: 10 * time.Second,
 	}
-	if fs, ok := store.(*creds.FileStore); ok {
-		h.StoreLabel = fs.Path()
+	if store != nil {
+		if info := store.Info(); info.Source == creds.SourceFile {
+			h.StoreLabel = info.Description
+		}
 	}
 	return h
 }

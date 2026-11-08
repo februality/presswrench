@@ -14,7 +14,8 @@ import (
 // browser flow, and stores the tokens. If the stored client was deleted
 // server-side, it registers a fresh one and retries once.
 func SignIn(ctx context.Context, store creds.Store, account string, o LoginOptions) (*TokenResponse, error) {
-	clientID, err := store.GetFor(account, creds.KeyOAuthClientID)
+	stored, err := store.Load(account)
+	clientID := stored.ClientID
 	fresh := false
 	if err != nil || clientID == "" {
 		if clientID, err = registerAndStore(ctx, store, account, o); err != nil {
@@ -35,8 +36,7 @@ func SignIn(ctx context.Context, store creds.Store, account string, o LoginOptio
 		return nil, err
 	}
 	// A new login replaces any previous session wholesale.
-	_ = store.DeleteFor(account, creds.KeyIdentity)
-	if err := SaveTokens(store, account, tr, time.Now()); err != nil {
+	if err := saveTokens(store, account, tr, time.Now(), true); err != nil {
 		return nil, err
 	}
 	return tr, nil
@@ -57,28 +57,39 @@ func registerAndStore(ctx context.Context, store creds.Store, account string, o 
 	if err != nil {
 		return "", err
 	}
-	if err := store.SetFor(account, creds.KeyOAuthClientID, clientID); err != nil {
+	r, err := loadForUpdate(store, account)
+	if err != nil {
+		return "", err
+	}
+	r.ClientID = clientID
+	if err := store.Save(account, r); err != nil {
 		return "", err
 	}
 	return clientID, nil
 }
 
-// SignOut revokes the stored tokens (best effort) and deletes the session.
-// The OAuth client registration is kept so a later login reuses it.
+// SignOut revokes the stored tokens (best effort) and clears the session,
+// saving a record with only the OAuth client id so a later login reuses
+// the registration.
 func SignOut(ctx context.Context, store creds.Store, account, authURL string) error {
-	clientID, _ := store.GetFor(account, creds.KeyOAuthClientID)
-	if clientID != "" {
-		for _, k := range []string{creds.KeyRefreshToken, creds.KeyAccessToken} {
-			if tok, err := store.GetFor(account, k); err == nil && tok != "" {
-				_ = Revoke(ctx, nil, authURL, clientID, tok)
+	r, err := store.Load(account)
+	if errors.Is(err, creds.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		if r, err = loadForUpdate(store, account); err != nil {
+			return err
+		}
+	}
+	if r.ClientID != "" {
+		for _, tok := range []string{r.RefreshToken, r.AccessToken} {
+			if tok != "" {
+				_ = Revoke(ctx, nil, authURL, r.ClientID, tok)
 			}
 		}
 	}
-	var firstErr error
-	for _, k := range []string{creds.KeyAccessToken, creds.KeyAccessExpiry, creds.KeyRefreshToken, creds.KeyIdentity} {
-		if err := store.DeleteFor(account, k); err != nil && firstErr == nil {
-			firstErr = err
-		}
+	if r.ClientID == "" {
+		return store.Delete(account)
 	}
-	return firstErr
+	return store.Save(account, creds.Record{ClientID: r.ClientID})
 }

@@ -1,61 +1,77 @@
 package creds
 
 import (
-	"os"
+	"errors"
+	"fmt"
 	"path/filepath"
-	"reflect"
-	"runtime"
 	"testing"
 )
 
-func TestFileStore_RoundTripAndAccounts(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "sub", "credentials.json")
-	s := NewFileStore(path)
-
-	if _, err := s.GetFor("", KeyRefreshToken); err != ErrNotFound {
-		t.Fatalf("empty store: err = %v", err)
+func TestError_KindsAndIs(t *testing.T) {
+	nf := &Error{Kind: KindNotFound, Account: "acme", Op: "load"}
+	if !errors.Is(nf, ErrNotFound) || !errors.Is(fmt.Errorf("wrapped: %w", nf), ErrNotFound) {
+		t.Error("NotFound *Error should match ErrNotFound")
 	}
-	must(t, s.SetFor("", KeyRefreshToken, "r0"))
-	must(t, s.SetFor("acme", KeyRefreshToken, "r1"))
-	must(t, s.SetFor("acme", KeyOAuthClientID, "c1"))
-	must(t, s.SetFor("half", KeyOAuthClientID, "c2")) // no refresh token: not an account
-
-	if v, _ := s.GetFor("acme", KeyRefreshToken); v != "r1" {
-		t.Errorf("acme refresh = %q", v)
+	if errors.Is(&Error{Kind: KindLocked}, ErrNotFound) {
+		t.Error("Locked must not match ErrNotFound")
 	}
-	accts, err := s.Accounts()
-	must(t, err)
-	if !reflect.DeepEqual(accts, []string{"", "acme"}) {
-		t.Errorf("accounts = %q", accts)
+	if KindOf(errors.New("plain")) != KindOther || KindOf(nil) != KindOther {
+		t.Error("non-*Error should be KindOther")
 	}
-
-	if runtime.GOOS != "windows" {
-		st, err := os.Stat(path)
-		must(t, err)
-		if st.Mode().Perm() != 0o600 {
-			t.Errorf("mode = %o, want 600", st.Mode().Perm())
+	if KindOf(fmt.Errorf("wrapped: %w", &Error{Kind: KindDenied})) != KindDenied {
+		t.Error("KindOf should unwrap")
+	}
+	inner := errors.New("boom")
+	if !errors.Is(&Error{Kind: KindOther, Err: inner}, inner) {
+		t.Error("Unwrap should expose Err")
+	}
+	for k, want := range map[Kind]bool{
+		KindDenied: true, KindTooLarge: true, KindCorrupt: true, KindNewerFormat: true,
+		KindOther: false, KindNotFound: false, KindLocked: false, KindTimeout: false, KindUnavailable: false,
+	} {
+		if got := Permanent(&Error{Kind: k}); got != want {
+			t.Errorf("Permanent(kind %d) = %v, want %v", k, got, want)
 		}
 	}
-
-	must(t, DeleteSession(s, "acme"))
-	must(t, DeleteSession(s, "half"))
-	must(t, DeleteSession(s, ""))
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("file should be removed when empty, stat err = %v", err)
+	if Permanent(errors.New("plain")) {
+		t.Error("plain error should not be permanent")
 	}
 }
 
-func TestAccountsFromKeys(t *testing.T) {
-	keys := []string{
-		"refresh_token", "access_token",
-		"acme:refresh_token", "acme:oauth_client_id",
-		"half:oauth_client_id",
-		"weird:key:refresh_token",
+func TestBroken(t *testing.T) {
+	cause := errors.New("no keyring")
+	s := Broken(cause)
+	if _, err := s.Load("x"); err != cause {
+		t.Errorf("Load err = %v", err)
 	}
-	got := accountsFromKeys(keys)
-	want := []string{"", "acme", "weird:key"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("accountsFromKeys = %q, want %q", got, want)
+	if err := s.Save("x", Record{}); err != cause {
+		t.Errorf("Save err = %v", err)
+	}
+	if err := s.Delete("x"); err != cause {
+		t.Errorf("Delete err = %v", err)
+	}
+	if _, err := s.Accounts(); err != cause {
+		t.Errorf("Accounts err = %v", err)
+	}
+	if info := s.Info(); info.Source != SourceNotFound || info.Description != "unavailable" || info.Warning != "no keyring" {
+		t.Errorf("Info = %+v", info)
+	}
+}
+
+func TestConfigDirAndDefaultFilePath(t *testing.T) {
+	dir := t.TempDir()
+	old := configDir
+	t.Cleanup(func() { configDir = old })
+	configDir = func() (string, error) { return dir, nil }
+	got, err := ConfigDir()
+	must(t, err)
+	if got != dir {
+		t.Errorf("ConfigDir = %q", got)
+	}
+	p, err := DefaultFilePath()
+	must(t, err)
+	if p != filepath.Join(dir, "credentials.json") {
+		t.Errorf("DefaultFilePath = %q", p)
 	}
 }
 

@@ -150,7 +150,7 @@ func browserFollow(u string) error {
 	return nil
 }
 
-func newStore(t *testing.T) *creds.FileStore {
+func newStore(t *testing.T) creds.Store {
 	dir := t.TempDir()
 	lockDir = func() (string, error) { return dir, nil }
 	return creds.NewFileStore(filepath.Join(dir, "credentials.json"))
@@ -166,10 +166,15 @@ func TestSignIn_RegistersAndStoresSession(t *testing.T) {
 	if tr.Identity() != "Jane Doe <jane@example.com>" {
 		t.Errorf("identity = %q", tr.Identity())
 	}
-	for _, k := range []string{creds.KeyOAuthClientID, creds.KeyRefreshToken, creds.KeyAccessToken, creds.KeyAccessExpiry, creds.KeyIdentity} {
-		if v, err := store.GetFor("", k); err != nil || v == "" {
-			t.Errorf("stored %s missing: %v", k, err)
-		}
+	r, err := store.Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if r.V != creds.RecordVersion || r.ClientID == "" || r.RefreshToken == "" || r.AccessToken == "" || r.AccessExpiry == 0 {
+		t.Errorf("stored record incomplete: %+v", r)
+	}
+	if r.Identity != "Jane Doe <jane@example.com>" {
+		t.Errorf("stored identity = %q", r.Identity)
 	}
 	accts, _ := store.Accounts()
 	if len(accts) != 1 || accts[0] != "" {
@@ -180,11 +185,13 @@ func TestSignIn_RegistersAndStoresSession(t *testing.T) {
 func TestSignIn_ReRegistersWhenClientDeleted(t *testing.T) {
 	_, srv := newFakeAS(t)
 	store := newStore(t)
-	_ = store.SetFor("acme", creds.KeyOAuthClientID, "deleted-client")
+	if err := store.Save("acme", creds.Record{ClientID: "deleted-client"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := SignIn(context.Background(), store, "acme", LoginOptions{AuthURL: srv.URL, OpenBrowser: browserFollow, Timeout: 10 * time.Second}); err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
-	if id, _ := store.GetFor("acme", creds.KeyOAuthClientID); id == "deleted-client" {
+	if r, _ := store.Load("acme"); r.ClientID == "deleted-client" || r.ClientID == "" {
 		t.Error("client was not re-registered")
 	}
 }
@@ -234,7 +241,7 @@ func TestLogin_StateMismatch(t *testing.T) {
 	}
 }
 
-func signedInSession(t *testing.T, f *fakeAS, srv *httptest.Server) (*Session, *creds.FileStore) {
+func signedInSession(t *testing.T, f *fakeAS, srv *httptest.Server) (*Session, creds.Store) {
 	t.Helper()
 	store := newStore(t)
 	if _, err := SignIn(context.Background(), store, "", LoginOptions{AuthURL: srv.URL, OpenBrowser: browserFollow, Timeout: 10 * time.Second}); err != nil {
@@ -262,8 +269,8 @@ func TestSession_UsesStoredTokenThenRefreshes(t *testing.T) {
 	if err != nil || tok == "access-1" {
 		t.Fatalf("Token after expiry = %q, %v", tok, err)
 	}
-	if stored, _ := store.GetFor("", creds.KeyAccessToken); stored != tok {
-		t.Errorf("refreshed token not persisted: %q vs %q", stored, tok)
+	if stored, _ := store.Load(""); stored.AccessToken != tok {
+		t.Errorf("refreshed token not persisted: %q vs %q", stored.AccessToken, tok)
 	}
 }
 
@@ -292,9 +299,39 @@ func TestSession_RotatedRefreshTokenFromSibling(t *testing.T) {
 	}
 	// Make our process see an expired cached token and a stale refresh
 	// token, as if it had read the store before the sibling rotated it.
-	_ = store.SetFor("", creds.KeyAccessExpiry, "0")
+	expire(t, store, "")
 	if _, err := s.Token(context.Background()); err != nil {
 		t.Fatalf("Token after sibling rotation: %v", err)
+	}
+}
+
+// expire zeroes the stored access expiry, as if the cached access token
+// were missing its expiry.
+func expire(t *testing.T, store creds.Store, account string) {
+	t.Helper()
+	r, err := store.Load(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.AccessExpiry = 0
+	if err := store.Save(account, r); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSession_ZeroExpiryRefreshes(t *testing.T) {
+	f, srv := newFakeAS(t)
+	s, store := signedInSession(t, f, srv)
+	expire(t, store, "")
+	tok, err := s.Token(context.Background())
+	if err != nil || tok == "" {
+		t.Fatalf("Token = %q, %v", tok, err)
+	}
+	if f.refreshes != 1 {
+		t.Errorf("refreshes = %d, want 1", f.refreshes)
+	}
+	if r, _ := store.Load(""); r.AccessToken != tok || r.AccessExpiry == 0 {
+		t.Errorf("refreshed session not persisted: %+v", r)
 	}
 }
 
@@ -326,11 +363,18 @@ func TestSignOut_KeepsClientRegistration(t *testing.T) {
 	if err := SignOut(context.Background(), store, "", srv.URL); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.GetFor("", creds.KeyRefreshToken); err == nil {
-		t.Error("refresh token survived sign-out")
+	r, err := store.Load("")
+	if err != nil {
+		t.Fatalf("Load after sign-out: %v", err)
 	}
-	if id, _ := store.GetFor("", creds.KeyOAuthClientID); id == "" {
+	if r.RefreshToken != "" || r.AccessToken != "" || r.Identity != "" {
+		t.Errorf("session survived sign-out: %+v", r)
+	}
+	if r.ClientID == "" {
 		t.Error("client registration was deleted")
+	}
+	if accts, _ := store.Accounts(); len(accts) != 0 {
+		t.Errorf("signed-out account still listed: %q", accts)
 	}
 }
 

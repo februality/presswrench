@@ -3,6 +3,7 @@
 package creds
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -18,53 +19,53 @@ import (
 // prompt from every new `serve` process after each update.
 const securityPath = "/usr/bin/security"
 
-// Items are generic passwords with service "presswrench" and account = the
-// storage key ("<account>:<attr>", or the bare attr for the default account).
-type keychainStore struct {
+// keychainBackend stores raw values as generic passwords with service
+// "presswrench" and account = the storage key. The value is base64 of the
+// raw bytes. Interim: labels aren't set until the direct `security` wrapper
+// replaces zalando.
+type keychainBackend struct {
 	service string
 }
 
-func openKeyring() (Store, error) {
+func openKeyring() (rawBackend, Info, error) {
 	if err := exec.Command(securityPath, "default-keychain").Run(); err != nil {
-		return nil, fmt.Errorf("macOS keychain unavailable: %w", err)
+		return nil, Info{}, &Error{Kind: KindUnavailable, Op: "open", Backend: SourceKeyring, Detail: "macOS keychain unavailable: " + err.Error(), Err: err}
 	}
-	return &keychainStore{service: ServiceName}, nil
+	return &keychainBackend{service: ServiceName}, Info{Source: SourceKeyring, Description: "macOS login keychain"}, nil
 }
 
-func (k *keychainStore) GetFor(account, attr string) (string, error) {
-	v, err := keyring.Get(k.service, accountKey(account, attr))
+func (k *keychainBackend) get(key string) ([]byte, error) {
+	v, err := keyring.Get(k.service, key)
 	if errors.Is(err, keyring.ErrNotFound) {
-		return "", ErrNotFound
+		return nil, &Error{Kind: KindNotFound}
 	}
 	if err != nil {
-		return "", fmt.Errorf("Reading %q from the macOS keychain: %w", accountKey(account, attr), err)
+		return nil, &Error{Kind: KindOther, Detail: fmt.Sprintf("reading %q from the macOS keychain: %v", key, err), Err: err}
 	}
-	return v, nil
+	b, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return nil, &Error{Kind: KindCorrupt, Detail: fmt.Sprintf("keychain item %q is not base64", key), Err: err}
+	}
+	return b, nil
 }
 
-func (k *keychainStore) SetFor(account, attr, value string) error {
-	if err := keyring.Set(k.service, accountKey(account, attr), value); err != nil {
-		return fmt.Errorf("Saving %q to the macOS keychain: %w", accountKey(account, attr), err)
+func (k *keychainBackend) set(key, _ string, value []byte) error {
+	err := keyring.Set(k.service, key, base64.StdEncoding.EncodeToString(value))
+	if errors.Is(err, keyring.ErrSetDataTooBig) {
+		return &Error{Kind: KindTooLarge, Detail: fmt.Sprintf("%d bytes is too large for the macOS keychain", len(value)), Err: err}
+	}
+	if err != nil {
+		return &Error{Kind: KindOther, Detail: fmt.Sprintf("saving %q to the macOS keychain: %v", key, err), Err: err}
 	}
 	return nil
 }
 
-func (k *keychainStore) DeleteFor(account, attr string) error {
-	err := keyring.Delete(k.service, accountKey(account, attr))
+func (k *keychainBackend) del(key string) error {
+	err := keyring.Delete(k.service, key)
 	if err == nil || errors.Is(err, keyring.ErrNotFound) {
 		return nil
 	}
-	return fmt.Errorf("Deleting %q from the macOS keychain: %w", accountKey(account, attr), err)
+	return &Error{Kind: KindOther, Detail: fmt.Sprintf("deleting %q from the macOS keychain: %v", key, err), Err: err}
 }
 
-// Accounts lists items from `security dump-keychain` without -d: attributes
-// only, so it reads no secrets and never prompts.
-func (k *keychainStore) Accounts() ([]string, error) {
-	out, err := exec.Command(securityPath, "dump-keychain").Output()
-	if err != nil {
-		return nil, fmt.Errorf("Listing macOS keychain items: %w", err)
-	}
-	return accountsFromKeys(keysFromKeychainDump(string(out), k.service)), nil
-}
-
-func (k *keychainStore) Backend() Source { return SourceKeyring }
+func (k *keychainBackend) maxValue() int { return 0 }

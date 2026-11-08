@@ -104,7 +104,7 @@ func newAccountsRemove() *cobra.Command {
 			if cfg, err := loadConfigFor(account); err == nil {
 				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
 			}
-			_ = creds.DeleteSession(store, account)
+			_ = store.Delete(account)
 			u := ui.New(os.Stdout, os.Stdin)
 			u.Step("Signed out and removed the session", "account "+account)
 			for _, p := range clients.All(account) {

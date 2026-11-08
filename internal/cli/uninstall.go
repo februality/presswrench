@@ -106,7 +106,7 @@ func NewUninstall() *cobra.Command {
 					return err
 				}
 				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
-				_ = creds.DeleteSession(store, account)
+				_ = store.Delete(account)
 				u.Step("Signed out and removed the stored session", "account "+accountLabel(account))
 			}
 

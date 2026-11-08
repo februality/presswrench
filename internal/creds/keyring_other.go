@@ -4,78 +4,85 @@ package creds
 
 import (
 	"errors"
+	"runtime"
 
 	"github.com/99designs/keyring"
 )
 
-type keyringStore struct {
+// winCredLimit is Windows Credential Manager's blob size limit.
+const winCredLimit = 2560
+
+// keyringBackend stores raw values in Windows Credential Manager or the
+// Linux Secret Service.
+type keyringBackend struct {
 	r keyring.Keyring
 }
 
-// openKeyring opens an OS-native keychain. Restricts to backends that don't
-// prompt for a passphrase: macOS Keychain, Windows Credential Manager,
-// Linux Secret Service. Returns an error on systems where none are present
+// openKeyring opens an OS-native keyring. Restricts to backends that don't
+// prompt for a passphrase: Windows Credential Manager, Linux Secret
+// Service. Fails (KindUnavailable) on systems where none are present
 // (headless Linux, Docker without a host bridge, WSL minimal).
-func openKeyring() (Store, error) {
+func openKeyring() (rawBackend, Info, error) {
+	unavailable := func(err error) (rawBackend, Info, error) {
+		return nil, Info{}, &Error{Kind: KindUnavailable, Op: "open", Backend: SourceKeyring, Detail: err.Error(), Err: err}
+	}
 	r, err := keyring.Open(keyring.Config{
 		ServiceName: ServiceName,
 		AllowedBackends: []keyring.BackendType{
-			keyring.KeychainBackend,
 			keyring.WinCredBackend,
 			keyring.SecretServiceBackend,
 		},
-		KeychainTrustApplication:       true,
-		KeychainAccessibleWhenUnlocked: true,
 	})
 	if err != nil {
-		return nil, err
+		return unavailable(err)
 	}
 	// Probe: a working backend should let us List() without error. This
 	// surfaces "no D-Bus session" failures here instead of on first Set().
 	if _, err := r.Keys(); err != nil {
-		return nil, err
+		return unavailable(err)
 	}
-	return &keyringStore{r: r}, nil
+	desc := "Secret Service keyring"
+	if runtime.GOOS == "windows" {
+		desc = "Windows Credential Manager"
+	}
+	return &keyringBackend{r: r}, Info{Source: SourceKeyring, Description: desc}, nil
 }
 
-func (k *keyringStore) GetFor(account, attr string) (string, error) {
-	item, err := k.r.Get(accountKey(account, attr))
+func (k *keyringBackend) get(key string) ([]byte, error) {
+	item, err := k.r.Get(key)
+	if errors.Is(err, keyring.ErrKeyNotFound) {
+		return nil, &Error{Kind: KindNotFound}
+	}
 	if err != nil {
-		if errors.Is(err, keyring.ErrKeyNotFound) {
-			return "", ErrNotFound
-		}
-		return "", err
+		return nil, &Error{Kind: KindOther, Detail: err.Error(), Err: err}
 	}
-	return string(item.Data), nil
+	return item.Data, nil
 }
 
-func (k *keyringStore) SetFor(account, attr, value string) error {
-	key := accountKey(account, attr)
-	return k.r.Set(keyring.Item{
+func (k *keyringBackend) set(key, label string, value []byte) error {
+	err := k.r.Set(keyring.Item{
 		Key:         key,
-		Data:        []byte(value),
-		Label:       ServiceName + "/" + key,
+		Data:        value,
+		Label:       label,
 		Description: "PressWrench session",
 	})
+	if err != nil {
+		return &Error{Kind: KindOther, Detail: err.Error(), Err: err}
+	}
+	return nil
 }
 
-func (k *keyringStore) DeleteFor(account, attr string) error {
-	err := k.r.Remove(accountKey(account, attr))
-	if errors.Is(err, keyring.ErrKeyNotFound) {
+func (k *keyringBackend) del(key string) error {
+	err := k.r.Remove(key)
+	if err == nil || errors.Is(err, keyring.ErrKeyNotFound) {
 		return nil
 	}
-	return err
+	return &Error{Kind: KindOther, Detail: err.Error(), Err: err}
 }
 
-func (k *keyringStore) Accounts() ([]string, error) {
-	keys, err := k.r.Keys()
-	if err != nil {
-		return nil, err
+func (k *keyringBackend) maxValue() int {
+	if runtime.GOOS == "windows" {
+		return winCredLimit
 	}
-	return accountsFromKeys(keys), nil
+	return 0
 }
-
-func (k *keyringStore) Backend() Source { return SourceKeyring }
-
-// accountsFromKeys derives account names from raw backend keys: an account
-// counts when it has a refresh token stored.

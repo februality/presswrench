@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -63,10 +62,10 @@ func (s *Session) Source() creds.Source {
 	if s.store == nil {
 		return creds.SourceNotFound
 	}
-	if _, err := s.store.GetFor(s.account, creds.KeyRefreshToken); err != nil {
+	if r, err := s.store.Load(s.account); err != nil || !r.SignedIn() {
 		return creds.SourceNotFound
 	}
-	return s.store.Backend()
+	return s.store.Info().Source
 }
 
 // Identity returns the stored "Name <email>" of the signed-in user, or "".
@@ -74,8 +73,8 @@ func (s *Session) Identity() string {
 	if s.store == nil {
 		return ""
 	}
-	v, _ := s.store.GetFor(s.account, creds.KeyIdentity)
-	return v
+	r, _ := s.store.Load(s.account)
+	return r.Identity
 }
 
 // Token returns a valid access token, refreshing if necessary.
@@ -115,14 +114,11 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 		return tok, nil
 	}
 
-	clientID, err := s.store.GetFor(s.account, creds.KeyOAuthClientID)
-	if err != nil {
+	stored, err := s.store.Load(s.account)
+	if err != nil || stored.ClientID == "" || stored.RefreshToken == "" {
 		return "", ErrLoginRequired
 	}
-	refresh, err := s.store.GetFor(s.account, creds.KeyRefreshToken)
-	if err != nil {
-		return "", ErrLoginRequired
-	}
+	clientID, refresh := stored.ClientID, stored.RefreshToken
 	tr, err := Refresh(ctx, s.http, s.authURL, clientID, refresh)
 	var oe *OAuthError
 	if errors.As(err, &oe) && oe.Code == "invalid_grant" {
@@ -132,8 +128,8 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 			s.access, s.expiry = tok, exp
 			return tok, nil
 		}
-		if again, gerr := s.store.GetFor(s.account, creds.KeyRefreshToken); gerr == nil && again != refresh {
-			tr, err = Refresh(ctx, s.http, s.authURL, clientID, again)
+		if again, gerr := s.store.Load(s.account); gerr == nil && again.RefreshToken != "" && again.RefreshToken != refresh {
+			tr, err = Refresh(ctx, s.http, s.authURL, clientID, again.RefreshToken)
 		}
 		if errors.As(err, &oe) && oe.Code == "invalid_grant" {
 			return "", ErrLoginRequired
@@ -162,41 +158,55 @@ func (s *Session) Invalidate(token string) {
 	}
 }
 
+// loadStoredAccess returns the stored access token and its expiry. A
+// missing expiry reads as the Unix epoch, i.e. expired, so it refreshes.
 func (s *Session) loadStoredAccess() (string, time.Time, bool) {
-	tok, err := s.store.GetFor(s.account, creds.KeyAccessToken)
-	if err != nil || tok == "" {
+	r, err := s.store.Load(s.account)
+	if err != nil || r.AccessToken == "" {
 		return "", time.Time{}, false
 	}
-	raw, err := s.store.GetFor(s.account, creds.KeyAccessExpiry)
-	if err != nil {
-		return "", time.Time{}, false
-	}
-	secs, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil {
-		return "", time.Time{}, false
-	}
-	return tok, time.Unix(secs, 0), true
+	return r.AccessToken, time.Unix(r.AccessExpiry, 0), true
 }
 
-// SaveTokens persists a token response. The refresh token is only
-// overwritten when Pressable issued a new one.
+// SaveTokens persists a token response in one write: it loads the record,
+// replaces the token fields (the refresh token only when Pressable issued a
+// new one) and the identity (when the response carries one), and saves it.
 func SaveTokens(store creds.Store, account string, tr *TokenResponse, now time.Time) error {
+	return saveTokens(store, account, tr, now, false)
+}
+
+// saveTokens is SaveTokens; replace (a new login) also drops the previous
+// identity, so the session is replaced wholesale.
+func saveTokens(store creds.Store, account string, tr *TokenResponse, now time.Time, replace bool) error {
+	r, err := loadForUpdate(store, account)
+	if err != nil {
+		return err
+	}
 	if tr.RefreshToken != "" {
-		if err := store.SetFor(account, creds.KeyRefreshToken, tr.RefreshToken); err != nil {
-			return err
-		}
+		r.RefreshToken = tr.RefreshToken
 	}
-	if err := store.SetFor(account, creds.KeyAccessToken, tr.AccessToken); err != nil {
-		return err
-	}
-	exp := now.Add(time.Duration(tr.ExpiresIn) * time.Second).Unix()
-	if err := store.SetFor(account, creds.KeyAccessExpiry, strconv.FormatInt(exp, 10)); err != nil {
-		return err
+	r.AccessToken = tr.AccessToken
+	r.AccessExpiry = now.Add(time.Duration(tr.ExpiresIn) * time.Second).Unix()
+	if replace {
+		r.Identity = ""
 	}
 	if id := tr.Identity(); id != "" {
-		if err := store.SetFor(account, creds.KeyIdentity, id); err != nil {
-			return err
-		}
+		r.Identity = id
 	}
-	return nil
+	return store.Save(account, r)
+}
+
+// loadForUpdate loads the record a write will modify. A missing, corrupt or
+// newer-format record starts from empty (the write replaces it); any other
+// error (store unreachable) is returned.
+func loadForUpdate(store creds.Store, account string) (creds.Record, error) {
+	r, err := store.Load(account)
+	switch creds.KindOf(err) {
+	case creds.KindNotFound, creds.KindCorrupt, creds.KindNewerFormat:
+		return creds.Record{}, nil
+	}
+	if err != nil {
+		return creds.Record{}, err
+	}
+	return r, nil
 }

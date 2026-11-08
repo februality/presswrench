@@ -3,6 +3,7 @@
 package creds
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -17,41 +18,43 @@ func TestKeychainStore_RealKeychain(t *testing.T) {
 	if os.Getenv("PRESSWRENCH_KEYCHAIN_TEST") != "1" {
 		t.Skip("set PRESSWRENCH_KEYCHAIN_TEST=1 to run against the real keychain")
 	}
-	if _, err := openKeyring(); err != nil {
+	if _, _, err := openKeyring(); err != nil {
 		t.Fatal(err)
 	}
-	k := &keychainStore{service: fmt.Sprintf("presswrench-test-%d", time.Now().UnixNano())}
+	raw := &keychainBackend{service: fmt.Sprintf("presswrench-test-%d", time.Now().UnixNano())}
+	s := newRecordStore(raw, Info{Source: SourceKeyring}, t.TempDir())
 	t.Cleanup(func() {
 		for _, a := range []string{"", "acme"} {
-			_ = DeleteSession(k, a)
+			_ = s.Delete(a)
 		}
+		_ = raw.del(indexKey)
 	})
 
-	if _, err := k.GetFor("", KeyRefreshToken); err != ErrNotFound {
-		t.Fatalf("missing key: err = %v, want ErrNotFound", err)
+	if _, err := s.Load(""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing record: err = %v, want ErrNotFound", err)
 	}
 	// JWT-sized access token, plus characters that need shell quoting.
-	big := strings.Repeat("eyJhbGciOi.", 230) + ` it's "quoted" $HOME`
-	must(t, k.SetFor("", KeyAccessToken, big))
-	must(t, k.SetFor("", KeyRefreshToken, "r0"))
-	must(t, k.SetFor("acme", KeyRefreshToken, "r1"))
-	must(t, k.SetFor("acme", KeyRefreshToken, "r2")) // overwrite in place
+	big := strings.Repeat("eyJhbGciOi.", 230) + ` it's "quoted" $HOME` + "\n é"
+	want := Record{V: RecordVersion, ClientID: "c0", RefreshToken: "r0", AccessToken: big, AccessExpiry: 1794101512}
+	must(t, s.Save("", want))
+	must(t, s.Save("acme", Record{RefreshToken: "r1"}))
+	must(t, s.Save("acme", Record{RefreshToken: "r2"})) // overwrite in place
 
-	if v, err := k.GetFor("", KeyAccessToken); err != nil || v != big {
-		t.Fatalf("access token round-trip: err=%v, len=%d want %d", err, len(v), len(big))
+	if got, err := s.Load(""); err != nil || got != want {
+		t.Fatalf("round-trip: err=%v, len=%d want %d", err, len(got.AccessToken), len(big))
 	}
-	if v, _ := k.GetFor("acme", KeyRefreshToken); v != "r2" {
-		t.Errorf("acme refresh = %q, want r2", v)
+	if r, _ := s.Load("acme"); r.RefreshToken != "r2" {
+		t.Errorf("acme refresh = %q, want r2", r.RefreshToken)
 	}
-	accts, err := k.Accounts()
+	accts, err := s.Accounts()
 	must(t, err)
 	if !reflect.DeepEqual(accts, []string{"", "acme"}) {
 		t.Errorf("accounts = %q", accts)
 	}
 
-	must(t, DeleteSession(k, "acme"))
-	must(t, k.DeleteFor("acme", KeyRefreshToken)) // already gone: not an error
-	if _, err := k.GetFor("acme", KeyRefreshToken); err != ErrNotFound {
+	must(t, s.Delete("acme"))
+	must(t, s.Delete("acme")) // already gone: not an error
+	if _, err := s.Load("acme"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("after delete: err = %v", err)
 	}
 }

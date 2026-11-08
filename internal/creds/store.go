@@ -1,49 +1,35 @@
-// Package creds persists the per-install Pressable OAuth session: the
+// Package creds persists each account's Pressable OAuth session: the
 // dynamically registered OAuth client ID, the refresh token, the current
 // access token and its expiry, and the signed-in identity (for display).
 //
-// Backends, in order of preference:
+// Each account is one versioned JSON Record stored under the key
+// "session:<account>" ("session:default" for the default account), plus an
+// account index under "accounts". Record encoding, versioning, size checks
+// and the index live in recordStore; each backend only stores bytes by key:
 //
-//  1. OS keychain. macOS: the login keychain via /usr/bin/security
-//     (github.com/zalando/go-keyring), so the item's ACL trusts Apple's
-//     stably signed tool rather than our ad-hoc signed binary, whose cdhash
-//     changes on every build and re-triggers the keychain prompt. Windows
-//     Credential Manager / Linux Secret Service: github.com/99designs/keyring.
+//  1. OS keychain. macOS: the login keychain via /usr/bin/security, so the
+//     item's ACL trusts Apple's stably signed tool rather than our ad-hoc
+//     signed binary, whose cdhash changes on every build and re-triggers the
+//     keychain prompt. Windows Credential Manager / Linux Secret Service:
+//     github.com/99designs/keyring.
 //  2. File fallback at <user config dir>/presswrench/credentials.json
 //     (mode 0600) for headless Linux / WSL / Docker.
 //
 // PRESSWRENCH_ACCESS_TOKEN in the environment bypasses the store entirely
 // (see internal/auth) — useful for CI and ephemeral containers.
-//
-// Multi-account model: attributes for named accounts are stored under
-// composite keys ("<account>:<attr>"). DefaultAccount ("") uses the bare
-// attribute name.
 package creds
 
 import (
-	"errors"
-	"sort"
-	"strings"
+	"os"
+	"path/filepath"
 )
 
 const (
 	ServiceName = "presswrench"
 
-	KeyOAuthClientID = "oauth_client_id"
-	KeyRefreshToken  = "refresh_token"
-	KeyAccessToken   = "access_token"
-	// KeyAccessExpiry is the access token's expiry as Unix seconds.
-	KeyAccessExpiry = "access_expiry"
-	// KeyIdentity is "Name <email>" of the signed-in Pressable user.
-	KeyIdentity = "identity"
-
 	// DefaultAccount is the empty-string sentinel for the unnamed account.
 	DefaultAccount = ""
 )
-
-// SessionKeys lists every attribute that makes up a stored session, in the
-// order they're deleted on logout.
-var SessionKeys = []string{KeyAccessToken, KeyAccessExpiry, KeyRefreshToken, KeyIdentity, KeyOAuthClientID}
 
 // Source tags where a credential came from. Surfaced in status / doctor.
 type Source string
@@ -55,39 +41,74 @@ const (
 	SourceNotFound Source = "not_found"
 )
 
-// accountKey returns the storage key for an (account, attr) pair.
-func accountKey(account, attr string) string {
-	if account == DefaultAccount {
-		return attr
-	}
-	return account + ":" + attr
+// Info describes a store for status / doctor.
+type Info struct {
+	Source      Source
+	Description string // e.g. "macOS login keychain", or the file path
+	Warning     string // why this store is in use or degraded, if notable
 }
 
-// Store is the persistence backend.
+// Store persists one Record per account.
 type Store interface {
-	GetFor(account, attr string) (string, error)
-	SetFor(account, attr, value string) error
-	DeleteFor(account, attr string) error
-	// Accounts returns every account with a stored refresh token.
-	// DefaultAccount ("") is included when it has one.
+	// Load returns the account's record; an error matching ErrNotFound
+	// when there is none.
+	Load(account string) (Record, error)
+	// Save writes the whole record in one operation and indexes the account.
+	Save(account string, r Record) error
+	// Delete removes the record and its index entry; absent is not an error.
+	Delete(account string) error
+	// Accounts returns every signed-in account, sorted (DefaultAccount ""
+	// first when present).
 	Accounts() ([]string, error)
-	Backend() Source
+	Info() Info
 }
 
-// ErrNotFound is returned by GetFor when the requested key is absent.
-var ErrNotFound = errors.New("credential not found")
+// rawBackend stores opaque values by key. get of an absent key returns an
+// *Error of KindNotFound; del of an absent key returns nil. maxValue is the
+// largest value the backend accepts, 0 for unlimited.
+type rawBackend interface {
+	get(key string) ([]byte, error)
+	set(key, label string, value []byte) error
+	del(key string) error
+	maxValue() int
+}
 
-// Open returns the best available Store for this environment. Tries the OS
-// keychain first; falls back to FileStore on systems without one.
-func Open() (Store, error) {
-	if ks, err := openKeyring(); err == nil {
-		return ks, nil
+// configDir is <user config dir>/presswrench; overridable in tests.
+var configDir = func() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
 	}
-	return OpenFile()
+	return filepath.Join(dir, ServiceName), nil
 }
 
-// ListAccounts returns every account with a stored session, sorted
-// (DefaultAccount first when present).
+// ConfigDir returns PressWrench's directory in the user config dir (lock
+// files, the credentials file). Honors XDG_CONFIG_HOME on Unix.
+func ConfigDir() (string, error) { return configDir() }
+
+// DefaultFilePath returns the canonical credentials-file path for this OS.
+func DefaultFilePath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "credentials.json"), nil
+}
+
+// Open returns the best available Store for this environment: the OS
+// keychain, else the file fallback.
+func Open() (Store, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	if raw, info, err := openKeyring(); err == nil {
+		return newRecordStore(raw, info, dir), nil
+	}
+	return NewFileStore(filepath.Join(dir, "credentials.json")), nil
+}
+
+// ListAccounts returns every signed-in account in the default store.
 func ListAccounts() ([]string, error) {
 	store, err := Open()
 	if err != nil {
@@ -96,35 +117,16 @@ func ListAccounts() ([]string, error) {
 	return store.Accounts()
 }
 
-// DeleteSession removes every stored attribute for the account. Missing
-// attributes are not an error.
-func DeleteSession(store Store, account string) error {
-	var firstErr error
-	for _, k := range SessionKeys {
-		if err := store.DeleteFor(account, k); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
+// Broken returns a Store whose every operation fails with err, so callers
+// that couldn't open a store still have one to report through.
+func Broken(err error) Store { return brokenStore{err} }
 
-// accountsFromKeys derives account names from storage keys: an account
-// exists when its refresh token does.
-func accountsFromKeys(keys []string) []string {
-	seen := map[string]struct{}{}
-	for _, key := range keys {
-		account, attr := DefaultAccount, key
-		if idx := strings.LastIndex(key, ":"); idx >= 1 {
-			account, attr = key[:idx], key[idx+1:]
-		}
-		if attr == KeyRefreshToken {
-			seen[account] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
+type brokenStore struct{ err error }
+
+func (b brokenStore) Load(string) (Record, error) { return Record{}, b.err }
+func (b brokenStore) Save(string, Record) error   { return b.err }
+func (b brokenStore) Delete(string) error         { return b.err }
+func (b brokenStore) Accounts() ([]string, error) { return nil, b.err }
+func (b brokenStore) Info() Info {
+	return Info{Source: SourceNotFound, Description: "unavailable", Warning: b.err.Error()}
 }

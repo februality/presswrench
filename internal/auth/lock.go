@@ -18,13 +18,7 @@ const (
 )
 
 // lockDir is where refresh locks live; overridable in tests.
-var lockDir = func() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, creds.ServiceName), nil
-}
+var lockDir = creds.ConfigDir
 
 // acquireRefreshLock takes a cross-process lock for refreshing one
 // account's session. It's an O_EXCL lockfile rather than flock so it works

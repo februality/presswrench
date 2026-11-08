@@ -1,84 +1,98 @@
 package creds
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
+	"time"
+
+	"github.com/februality/presswrench/internal/lockfile"
 )
 
-// FileStore persists credentials as JSON at mode 0600 in the user's config
-// directory. Used as a fallback when the OS keychain isn't available.
-// Writes are atomic (unique temp file + rename). Concurrent writers from
-// different processes are last-writer-wins per file; the one write path
-// that races in practice — token refresh — is serialized by the refresh
-// lock in internal/auth.
-//
-// On-disk shape: {"accounts": {"": {...attrs}, "acme": {...attrs}}}. The
-// default account is stored under the empty-string key.
-type FileStore struct {
+// fileVersion is the format of the credentials file envelope.
+const fileVersion = 1
+
+const fileLockWait = 30 * time.Second
+
+// fileBackend stores raw values in one JSON file at mode 0600:
+// {"v":1,"items":{"<key>":"<value>"}}. Values are the record/index JSON,
+// kept as strings so the file stays readable. Writes are atomic (unique
+// temp file + rename) and serialized across processes by a lockfile next
+// to the file, so two processes saving different accounts can't lose each
+// other's write. Files from earlier builds (no "v") are ignored and
+// replaced on the next write.
+type fileBackend struct {
 	path string
-	mu   sync.Mutex
+	mu   sync.Mutex // in-process; the lockfile covers other processes
 }
 
 type fileEnvelope struct {
-	Accounts map[string]map[string]string `json:"accounts"`
+	V     int               `json:"v"`
+	Items map[string]string `json:"items"`
 }
 
-// DefaultFilePath returns the canonical credentials-file path for this OS.
-// Honors XDG_CONFIG_HOME on Unix.
-func DefaultFilePath() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
+// NewFileStore returns a Store backed by the file at path. Its index lock
+// lives in the same directory.
+func NewFileStore(path string) Store {
+	return newRecordStore(&fileBackend{path: path}, Info{Source: SourceFile, Description: path}, filepath.Dir(path))
+}
+
+func (f *fileBackend) fileError(err error, what string) error {
+	kind := KindOther
+	if errors.Is(err, os.ErrPermission) {
+		kind = KindDenied
 	}
-	return filepath.Join(dir, ServiceName, "credentials.json"), nil
+	return &Error{Kind: kind, Detail: fmt.Sprintf("%s credentials file %s: %v", what, f.path, err), Err: err}
 }
 
-// OpenFile returns a FileStore at the default path.
-func OpenFile() (Store, error) {
-	p, err := DefaultFilePath()
-	if err != nil {
-		return nil, err
-	}
-	return &FileStore{path: p}, nil
-}
-
-// NewFileStore returns a FileStore at an explicit path (tests).
-func NewFileStore(path string) *FileStore { return &FileStore{path: path} }
-
-func (f *FileStore) load() (*fileEnvelope, error) {
-	env := &fileEnvelope{Accounts: map[string]map[string]string{}}
+func (f *fileBackend) load() (*fileEnvelope, error) {
+	env := &fileEnvelope{V: fileVersion, Items: map[string]string{}}
 	b, err := os.ReadFile(f.path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return env, nil
 		}
-		return nil, err
+		return nil, f.fileError(err, "reading")
 	}
-	if len(b) == 0 {
+	if len(bytes.TrimSpace(b)) == 0 {
 		return env, nil
 	}
-	if err := json.Unmarshal(b, env); err != nil {
-		return nil, fmt.Errorf("parse credentials file %s: %w", f.path, err)
+	var probe struct {
+		V int `json:"v"`
 	}
-	if env.Accounts == nil {
-		env.Accounts = map[string]map[string]string{}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return nil, &Error{Kind: KindCorrupt, Detail: "credentials file " + f.path + " is not valid JSON", Err: err}
+	}
+	if probe.V > fileVersion {
+		return nil, &Error{Kind: KindNewerFormat, Detail: fmt.Sprintf("credentials file %s has format %d, this build reads %d", f.path, probe.V, fileVersion)}
+	}
+	if probe.V < 1 {
+		return env, nil // earlier development builds: ignored
+	}
+	if err := json.Unmarshal(b, env); err != nil {
+		return nil, &Error{Kind: KindCorrupt, Detail: "credentials file " + f.path + " has unexpected contents", Err: err}
+	}
+	if env.Items == nil {
+		env.Items = map[string]string{}
 	}
 	return env, nil
 }
 
-func (f *FileStore) save(env *fileEnvelope) error {
-	if len(env.Accounts) == 0 {
-		if err := os.Remove(f.path); err != nil && !os.IsNotExist(err) {
-			return err
+func (f *fileBackend) save(env *fileEnvelope) error {
+	if len(env.Items) == 0 {
+		if err := os.Remove(f.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return f.fileError(err, "removing")
 		}
 		return nil
 	}
+	env.V = fileVersion
 	if err := os.MkdirAll(filepath.Dir(f.path), 0o700); err != nil {
-		return err
+		return f.fileError(err, "creating the directory for")
 	}
 	b, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
@@ -87,92 +101,79 @@ func (f *FileStore) save(env *fileEnvelope) error {
 	// Unique temp name: concurrent processes must not share one.
 	tmp, err := os.CreateTemp(filepath.Dir(f.path), ".credentials-*.tmp")
 	if err != nil {
-		return err
+		return f.fileError(err, "writing")
+	}
+	fail := func(err error) error {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return f.fileError(err, "writing")
 	}
 	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
+		return fail(err)
 	}
 	if _, err := tmp.Write(b); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmp.Name())
-		return err
+		return fail(err)
 	}
 	if err := tmp.Close(); err != nil {
 		_ = os.Remove(tmp.Name())
-		return err
+		return f.fileError(err, "writing")
 	}
-	return os.Rename(tmp.Name(), f.path)
+	if err := os.Rename(tmp.Name(), f.path); err != nil {
+		_ = os.Remove(tmp.Name())
+		return f.fileError(err, "writing")
+	}
+	return nil
 }
 
-func (f *FileStore) GetFor(account, attr string) (string, error) {
+// update runs a read-modify-write of the file under both locks. change
+// reports whether it modified env.
+func (f *fileBackend) update(change func(env *fileEnvelope) bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	env, err := f.load()
+	lock, err := lockfile.Acquire(context.Background(), f.path+".lock", fileLockWait)
 	if err != nil {
-		return "", err
+		return &Error{Kind: KindOther, Err: err}
 	}
-	v := env.Accounts[account][attr]
-	if v == "" {
-		return "", ErrNotFound
-	}
-	return v, nil
-}
-
-func (f *FileStore) SetFor(account, attr, value string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	defer lock.Release()
 	env, err := f.load()
 	if err != nil {
 		return err
 	}
-	if env.Accounts[account] == nil {
-		env.Accounts[account] = map[string]string{}
-	}
-	env.Accounts[account][attr] = value
-	return f.save(env)
-}
-
-func (f *FileStore) DeleteFor(account, attr string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	env, err := f.load()
-	if err != nil {
-		return err
-	}
-	m, ok := env.Accounts[account]
-	if !ok {
+	if !change(env) {
 		return nil
-	}
-	if _, ok := m[attr]; !ok {
-		return nil
-	}
-	delete(m, attr)
-	if len(m) == 0 {
-		delete(env.Accounts, account)
 	}
 	return f.save(env)
 }
 
-func (f *FileStore) Accounts() ([]string, error) {
+func (f *fileBackend) get(key string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	env, err := f.load()
 	if err != nil {
 		return nil, err
 	}
-	out := []string{}
-	for name, m := range env.Accounts {
-		if m[KeyRefreshToken] != "" {
-			out = append(out, name)
-		}
+	v, ok := env.Items[key]
+	if !ok {
+		return nil, &Error{Kind: KindNotFound}
 	}
-	sort.Strings(out)
-	return out, nil
+	return []byte(v), nil
 }
 
-func (f *FileStore) Backend() Source { return SourceFile }
+func (f *fileBackend) set(key, _ string, value []byte) error {
+	return f.update(func(env *fileEnvelope) bool {
+		env.Items[key] = string(value)
+		return true
+	})
+}
 
-// Path returns the on-disk path for diagnostics.
-func (f *FileStore) Path() string { return f.path }
+func (f *fileBackend) del(key string) error {
+	return f.update(func(env *fileEnvelope) bool {
+		if _, ok := env.Items[key]; !ok {
+			return false
+		}
+		delete(env.Items, key)
+		return true
+	})
+}
+
+func (f *fileBackend) maxValue() int { return 0 }
