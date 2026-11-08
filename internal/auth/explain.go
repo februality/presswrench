@@ -103,7 +103,10 @@ func Explain(err error) string {
 		case creds.KindDenied:
 			return "Access to PressWrench's keychain item was denied. Retry and choose Always Allow when macOS asks."
 		case creds.KindTimeout:
-			return "macOS is waiting for you to approve keychain access for PressWrench. Approve the dialog (Always Allow), then retry."
+			if runtime.GOOS == "darwin" {
+				return "macOS is waiting for you to approve keychain access for PressWrench. Approve the dialog (Always Allow), then retry."
+			}
+			return "The system keyring is waiting for you to unlock or approve access for PressWrench. Approve it, then retry."
 		case creds.KindUnavailable:
 			return "The system keyring isn't available (" + ce.Detail + "). Start it, or set PRESSWRENCH_CREDENTIAL_STORE=file and sign in again with `" + bareLoginCommand(ce.Account) + "`."
 		case creds.KindCorrupt:

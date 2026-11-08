@@ -130,3 +130,23 @@ func TestOverride(t *testing.T) {
 		}
 	}
 }
+
+// A keyring waiting on an unlock prompt exists: report the wait instead of
+// silently falling back to the file.
+func TestOpenWith_KeyringTimeoutDoesNotFallBack(t *testing.T) {
+	dir := t.TempDir()
+	for _, env := range []string{"", "keyring"} {
+		_, err := openWith(selectOpts{
+			env:        env,
+			markerPath: filepath.Join(dir, "store"),
+			filePath:   filepath.Join(dir, "credentials.json"),
+			lockDir:    dir,
+			openKeyring: func() (rawBackend, Info, error) {
+				return nil, Info{}, keyringTimeout("opening")
+			},
+		})
+		if KindOf(err) != KindTimeout {
+			t.Errorf("env %q: kind = %v (%v), want KindTimeout", env, KindOf(err), err)
+		}
+	}
+}

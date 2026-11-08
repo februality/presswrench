@@ -13,9 +13,11 @@ import (
 const winCredLimit = 2560
 
 // keyringBackend stores raw values in Windows Credential Manager or the
-// Linux Secret Service.
+// Linux Secret Service. Every call is bounded by keychainTimeout and
+// serialized through sem (see callWithin).
 type keyringBackend struct {
-	r keyring.Keyring
+	r   keyring.Keyring
+	sem chan struct{}
 }
 
 // openKeyring opens an OS-native keyring. Restricts to backends that don't
@@ -38,18 +40,26 @@ func openKeyring() (rawBackend, Info, error) {
 	}
 	// Probe: a working backend should let us List() without error. This
 	// surfaces "no D-Bus session" failures here instead of on first Set().
-	if _, err := r.Keys(); err != nil {
+	// A probe that times out (waiting on an unlock prompt) is reported as
+	// such: the keyring exists, so it must not fall back to the file.
+	if _, err := callWithin(keyringSem, "opening", r.Keys); err != nil {
+		if KindOf(err) == KindTimeout {
+			return nil, Info{}, err
+		}
 		return unavailable(err)
 	}
 	desc := "Secret Service keyring"
 	if runtime.GOOS == "windows" {
 		desc = "Windows Credential Manager"
 	}
-	return &keyringBackend{r: r}, Info{Source: SourceKeyring, Description: desc}, nil
+	return &keyringBackend{r: r, sem: keyringSem}, Info{Source: SourceKeyring, Description: desc}, nil
 }
 
 func (k *keyringBackend) get(key string) ([]byte, error) {
-	item, err := k.r.Get(key)
+	item, err := callWithin(k.sem, "reading", func() (keyring.Item, error) { return k.r.Get(key) })
+	if KindOf(err) == KindTimeout {
+		return nil, err
+	}
 	if errors.Is(err, keyring.ErrKeyNotFound) {
 		return nil, &Error{Kind: KindNotFound}
 	}
@@ -60,12 +70,17 @@ func (k *keyringBackend) get(key string) ([]byte, error) {
 }
 
 func (k *keyringBackend) set(key, label string, value []byte) error {
-	err := k.r.Set(keyring.Item{
-		Key:         key,
-		Data:        value,
-		Label:       label,
-		Description: "PressWrench session",
+	_, err := callWithin(k.sem, "saving to", func() (struct{}, error) {
+		return struct{}{}, k.r.Set(keyring.Item{
+			Key:         key,
+			Data:        value,
+			Label:       label,
+			Description: "PressWrench session",
+		})
 	})
+	if KindOf(err) == KindTimeout {
+		return err
+	}
 	if err != nil {
 		return &Error{Kind: KindOther, Detail: err.Error(), Err: err}
 	}
@@ -73,9 +88,12 @@ func (k *keyringBackend) set(key, label string, value []byte) error {
 }
 
 func (k *keyringBackend) del(key string) error {
-	err := k.r.Remove(key)
+	_, err := callWithin(k.sem, "deleting from", func() (struct{}, error) { return struct{}{}, k.r.Remove(key) })
 	if err == nil || errors.Is(err, keyring.ErrKeyNotFound) {
 		return nil
+	}
+	if KindOf(err) == KindTimeout {
+		return err
 	}
 	return &Error{Kind: KindOther, Detail: err.Error(), Err: err}
 }

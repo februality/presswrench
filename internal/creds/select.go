@@ -102,6 +102,9 @@ func openWith(o selectOpts) (Store, error) {
 		info.Warning = warning
 		return newRecordStore(raw, info, o.lockDir), nil
 	}
+	if KindOf(err) == KindTimeout {
+		return nil, err // the keyring exists but is waiting on a prompt
+	}
 	if want == "keyring" {
 		var e *Error
 		if errors.As(err, &e) && e.Kind == KindUnavailable {
