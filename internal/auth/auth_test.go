@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/februality/presswrench/internal/creds"
+	"github.com/februality/presswrench/internal/lockfile"
 )
 
 // fakeAS is a minimal OAuth authorization server: dynamic registration,
@@ -449,12 +450,23 @@ func TestLogin_ReportsBrowserOpened(t *testing.T) {
 
 // faultyStore wraps a real store with injectable failures. loadErr fails
 // every Load; saveErrs are consumed one per Save call (nil entry = succeed).
+// Write to the embedded Store directly to bypass the faults (as another
+// process would). Save is safe from a background goroutine; read the count
+// with saveCount there.
 type faultyStore struct {
 	creds.Store
 	loadErr   error
 	saveErrs  []error
 	saves     int
 	deleteErr error
+
+	mu sync.Mutex // guards saveErrs, saves
+}
+
+func (f *faultyStore) saveCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saves
 }
 
 func (f *faultyStore) Delete(account string) error {
@@ -472,13 +484,16 @@ func (f *faultyStore) Load(account string) (creds.Record, error) {
 }
 
 func (f *faultyStore) Save(account string, r creds.Record) error {
+	f.mu.Lock()
 	f.saves++
+	var err error
 	if len(f.saveErrs) > 0 {
-		err := f.saveErrs[0]
+		err = f.saveErrs[0]
 		f.saveErrs = f.saveErrs[1:]
-		if err != nil {
-			return err
-		}
+	}
+	f.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return f.Store.Save(account, r)
 }
@@ -508,5 +523,263 @@ func TestSession_InvalidGrantIsExpired(t *testing.T) {
 	var lr *LoginRequiredError
 	if !errors.As(err, &lr) || !lr.Expired || !errors.Is(err, ErrLoginRequired) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// failSaves returns n save errors of kind k.
+func failSaves(n int, k creds.Kind) []error {
+	errs := make([]error, n)
+	for i := range errs {
+		errs[i] = &creds.Error{Kind: k, Op: "save", Detail: "test failure"}
+	}
+	return errs
+}
+
+// pendingSession signs in (rotating refresh tokens), wraps the store with
+// the given save failures and returns a Session whose clock is past the
+// stored access token's expiry, so its first Token call refreshes. Save
+// backoff is zeroed; the session is closed at cleanup.
+func pendingSession(t *testing.T, saveErrs []error) (*Session, *faultyStore, *fakeAS, *httptest.Server) {
+	t.Helper()
+	oldBackoff := saveBackoff
+	saveBackoff = []time.Duration{0, 0}
+	t.Cleanup(func() { saveBackoff = oldBackoff })
+	f, srv := newFakeAS(t)
+	f.rotate = true
+	_, store := signedInSession(t, f, srv)
+	fs := &faultyStore{Store: store, saveErrs: saveErrs}
+	s := NewSession(fs, "", srv.URL)
+	s.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	t.Cleanup(s.Close)
+	return s, fs, f, srv
+}
+
+// lockFree reports whether the default account's lock can be taken now.
+func lockFree(t *testing.T) bool {
+	t.Helper()
+	shortLockWait(t, 100*time.Millisecond)
+	l, err := lockAccount(context.Background(), "")
+	if err != nil {
+		return false
+	}
+	l.Release()
+	return true
+}
+
+func TestSession_SaveFailureKeepsWorking(t *testing.T) {
+	s, fs, f, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil || tok != "access-2" {
+		t.Fatalf("Token = %q, %v; want the refreshed token despite the failed save", tok, err)
+	}
+	if n := fs.saveCount(); n != 3 {
+		t.Errorf("saves = %d, want 3 (1 + len(saveBackoff))", n)
+	}
+	again, err := s.Token(context.Background())
+	if err != nil || again != tok {
+		t.Fatalf("second Token = %q, %v; want %q from memory", again, err, tok)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.refreshes != 1 {
+		t.Errorf("refreshes = %d, want 1", f.refreshes)
+	}
+}
+
+func TestSession_SaveFailureHoldsLock(t *testing.T) {
+	s, fs, f, srv := pendingSession(t, failSaves(100, creds.KindOther))
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	shortLockWait(t, 100*time.Millisecond)
+	sibling := NewSession(fs.Store, "", srv.URL)
+	sibling.now = s.now
+	_, err := sibling.Token(context.Background())
+	var held *lockfile.HeldError
+	if !errors.As(err, &held) {
+		t.Fatalf("sibling err = %v, want *lockfile.HeldError", err)
+	}
+	if !strings.Contains(held.Reason, "account default") {
+		t.Errorf("Reason = %q, want it to name the account", held.Reason)
+	}
+	if !strings.Contains(Explain(err), "newer session it couldn't save") {
+		t.Errorf("Explain = %q", Explain(err))
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.refreshes != 1 || f.refreshRejected != 0 {
+		t.Errorf("refreshes = %d, rejected = %d; want 1, 0 (the sibling spent the stale token)", f.refreshes, f.refreshRejected)
+	}
+}
+
+func TestSession_PendingFlushedWhenStoreRecovers(t *testing.T) {
+	s, fs, _, _ := pendingSession(t, failSaves(3, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := fs.Store.Load(""); r.RefreshToken == "refresh-2" {
+		t.Fatal("saved although every attempt failed")
+	}
+	again, err := s.Token(context.Background())
+	if err != nil || again != tok {
+		t.Fatalf("Token = %q, %v; want %q", again, err, tok)
+	}
+	r, err := fs.Store.Load("")
+	if err != nil || r.RefreshToken != "refresh-2" || r.AccessToken != tok {
+		t.Fatalf("stored = %+v, %v; want the rotated session", r, err)
+	}
+	if !lockFree(t) {
+		t.Error("account lock still held after the session was saved")
+	}
+}
+
+func TestSession_PendingDiscardedWhenSuperseded(t *testing.T) {
+	s, fs, _, _ := pendingSession(t, failSaves(3, creds.KindOther))
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r, err := fs.Store.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.RefreshToken, r.AccessToken = "from-login", "access-from-login"
+	r.AccessExpiry = time.Now().Add(4 * time.Hour).Unix()
+	if err := fs.Store.Save("", r); err != nil { // another writer, bypassing the lock
+		t.Fatal(err)
+	}
+	tok, err := s.Token(context.Background())
+	if err != nil || tok != "access-from-login" {
+		t.Fatalf("Token = %q, %v; want the newer stored session", tok, err)
+	}
+	if r, _ := fs.Store.Load(""); r.RefreshToken != "from-login" {
+		t.Errorf("stored refresh token = %q; the newer session was overwritten", r.RefreshToken)
+	}
+	if !lockFree(t) {
+		t.Error("account lock still held after the pending session was discarded")
+	}
+}
+
+func TestSession_DeniedNotRetried(t *testing.T) {
+	s, fs, _, _ := pendingSession(t, failSaves(100, creds.KindDenied))
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := fs.saveCount(); n != 1 {
+		t.Errorf("saves = %d, want 1 (Denied is permanent)", n)
+	}
+}
+
+func TestSession_CloseReleasesLock(t *testing.T) {
+	s, _, _, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if lockFree(t) {
+		t.Fatal("lock not held while the session is unsaved")
+	}
+	s.Close()
+	if !lockFree(t) {
+		t.Error("lock still held after Close")
+	}
+	s.Close()
+}
+
+func TestSession_CloseWithoutToken(t *testing.T) {
+	f, srv := newFakeAS(t)
+	s, _ := signedInSession(t, f, srv)
+	s.Close()
+	s.Close()
+	NewSession(nil, "", srv.URL).Close()
+}
+
+func TestSession_PendingRetriedInBackground(t *testing.T) {
+	old := pendingRetry
+	pendingRetry = 20 * time.Millisecond
+	t.Cleanup(func() { pendingRetry = old })
+	s, fs, _, _ := pendingSession(t, failSaves(5, creds.KindOther)) // 3 on refresh, 2 on ticks
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if r, _ := fs.Store.Load(""); r.RefreshToken == "refresh-2" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background retry never saved the session (saves = %d)", fs.saveCount())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !lockFree(t) {
+		t.Error("lock still held after the background save")
+	}
+	n := fs.saveCount()
+	time.Sleep(100 * time.Millisecond)
+	if fs.saveCount() != n {
+		t.Error("background retry kept running after the session was saved")
+	}
+}
+
+func TestSession_InvalidateWhilePendingUsesPendingRefreshToken(t *testing.T) {
+	s, fs, f, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Invalidate(tok)
+	again, err := s.Token(context.Background())
+	if err != nil || again == tok {
+		t.Fatalf("Token after Invalidate = %q, %v", again, err)
+	}
+	f.mu.Lock()
+	attempts, rejected := f.refreshAttempts, f.refreshRejected
+	f.mu.Unlock()
+	if attempts != 2 || rejected != 0 {
+		t.Errorf("refresh attempts = %d, rejected = %d; want 2, 0 (the stale stored token was spent)", attempts, rejected)
+	}
+	// The store recovers: the latest rotation is what gets saved.
+	fs.mu.Lock()
+	fs.saveErrs = nil
+	fs.mu.Unlock()
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := fs.Store.Load(""); r.RefreshToken != "refresh-3" || r.AccessToken != again {
+		t.Errorf("stored = %q/%q, want refresh-3/%q", r.RefreshToken, r.AccessToken, again)
+	}
+	if !lockFree(t) {
+		t.Error("lock still held after the save")
+	}
+}
+
+func TestSession_PendingRevokedReleasesLock(t *testing.T) {
+	s, _, f, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Invalidate(tok)
+	f.mu.Lock()
+	f.refresh = map[string]bool{} // Pressable revoked the session
+	f.mu.Unlock()
+	_, err = s.Token(context.Background())
+	var lr *LoginRequiredError
+	if !errors.As(err, &lr) || !lr.Expired {
+		t.Fatalf("err = %v, want expired sign-in", err)
+	}
+	if !lockFree(t) {
+		t.Error("lock still held after the unsaved session was revoked")
+	}
+}
+
+func TestSession_TokenAfterCloseDoesNotKeepLock(t *testing.T) {
+	s, _, _, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	s.Close()
+	if _, err := s.Token(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !lockFree(t) {
+		t.Error("a closed session kept the account lock")
 	}
 }
