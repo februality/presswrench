@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	xssh "golang.org/x/crypto/ssh"
 
+	"github.com/februality/presswrench/internal/auth"
 	mcsh "github.com/februality/presswrench/internal/ssh"
 )
 
@@ -239,6 +240,7 @@ type sshStatus struct {
 	PublicKey   string         `json:"publicKey,omitempty"`
 	Host        string         `json:"host"`
 	AddKeyAt    string         `json:"addKeyAt"`
+	Session     string         `json:"session,omitempty"`
 	Site        *siteSSHStatus `json:"site,omitempty"`
 }
 
@@ -258,6 +260,9 @@ func handleSSHStatus(d *Deps) server.ToolHandlerFunc {
 			KeyLabel:  d.Cfg.SSHKeyLabel,
 			Host:      d.Cfg.SSHHost,
 			AddKeyAt:  "MyPressable → Profile → Settings → SSH Keys",
+		}
+		if _, err := d.Session.State(); err != nil {
+			st.Session = auth.Explain(err)
 		}
 		if pub, err := os.ReadFile(d.Cfg.SSHKeyPath + ".pub"); err == nil {
 			st.PublicKey = strings.TrimSpace(string(pub))

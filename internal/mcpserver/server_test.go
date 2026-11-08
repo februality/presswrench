@@ -240,3 +240,50 @@ func TestSSHStatus_NoSite(t *testing.T) {
 		t.Errorf("status = %+v", st)
 	}
 }
+
+// sessionGateway fails the way the real gateway does: by asking the session for a token.
+type sessionGateway struct {
+	fakeGateway
+	session *auth.Session
+}
+
+func (g *sessionGateway) CallTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
+	if _, err := g.session.Token(ctx); err != nil {
+		return nil, err
+	}
+	return g.fakeGateway.CallTool(ctx, name, args)
+}
+
+func TestSSHStatus_ReportsSessionProblem(t *testing.T) {
+	t.Setenv(auth.EnvAccessToken, "")
+	cerr := &creds.Error{Kind: creds.KindUnavailable, Detail: "no dbus"}
+	d := newDeps(&config.Config{SSHKeyPath: "/nonexistent/key", SSHKeyLabel: "presswrench"}, &fakeGateway{})
+	d.Session = auth.NewSession(creds.Broken(cerr), "", "")
+	res := call(t, handleSSHStatus(d), nil)
+	if res.IsError {
+		t.Fatalf("ssh_status must not fail: %q", text(res))
+	}
+	var st sshStatus
+	if err := json.Unmarshal([]byte(text(res)), &st); err != nil {
+		t.Fatalf("parse: %v (%s)", err, text(res))
+	}
+	if st.KeyPath != "/nonexistent/key" {
+		t.Errorf("keyPath = %q", st.KeyPath)
+	}
+	if st.Session == "" || st.Session != auth.Explain(cerr) {
+		t.Errorf("session = %q, want %q", st.Session, auth.Explain(cerr))
+	}
+}
+
+func TestGatewayTool_NotSignedInExplains(t *testing.T) {
+	t.Setenv(auth.EnvAccessToken, "")
+	store := creds.NewFileStore(t.TempDir() + "/creds.json")
+	sess := auth.NewSession(store, "", "http://127.0.0.1:1")
+	d := newDeps(&config.Config{}, nil)
+	d.Session = sess
+	d.Gateway = &sessionGateway{session: sess}
+	res := call(t, handleDiscover(d), nil)
+	if !res.IsError || !strings.Contains(text(res), "presswrench login") {
+		t.Fatalf("got %q", text(res))
+	}
+}
