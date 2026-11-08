@@ -12,6 +12,10 @@ import (
 // winCredLimit is Windows Credential Manager's blob size limit.
 const winCredLimit = 2560
 
+// keyringSem serializes calls into the keyring library: one call in flight
+// per process (see callWithin).
+var keyringSem = make(chan struct{}, 1)
+
 // keyringBackend stores raw values in Windows Credential Manager or the
 // Linux Secret Service. Every call is bounded by keychainTimeout and
 // serialized through sem (see callWithin).

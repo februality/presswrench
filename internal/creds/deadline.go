@@ -5,10 +5,6 @@ import (
 	"time"
 )
 
-// keyringSem serializes calls into the Windows/Linux keyring library: one
-// call in flight per process.
-var keyringSem = make(chan struct{}, 1)
-
 type callResult[T any] struct {
 	v   T
 	err error
