@@ -35,7 +35,16 @@ func runDoctor(u *ui.UI, site string) error {
 	fmt.Println("Running diagnostics…")
 	fmt.Println()
 
-	accts := discoveredAccounts()
+	store, openErr := openStore()
+	if openErr != nil {
+		u.Fail("Credential store "+u.Sep()+" unavailable", auth.Explain(openErr))
+		store = creds.Broken(openErr)
+	} else {
+		showStore(u, store)
+	}
+	fmt.Println()
+
+	accts := discoveredAccounts(store)
 	if len(accts) == 0 && os.Getenv(auth.EnvAccessToken) == "" {
 		u.Fail("No accounts configured", "run presswrench setup")
 		return errors.New("not signed in")
@@ -47,7 +56,7 @@ func runDoctor(u *ui.UI, site string) error {
 	var firstErr error
 	for _, account := range accts {
 		fmt.Printf("Account: %s\n", auth.AccountLabel(account))
-		if err := doctorAccount(u, account, site); err != nil && firstErr == nil {
+		if err := doctorAccount(u, store, account, site); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		fmt.Println()
@@ -59,15 +68,10 @@ func runDoctor(u *ui.UI, site string) error {
 	return firstErr
 }
 
-func doctorAccount(u *ui.UI, account, site string) error {
+func doctorAccount(u *ui.UI, store creds.Store, account, site string) error {
 	ctx := context.Background()
 	cfg, err := loadConfigFor(account)
 	if err != nil {
-		return err
-	}
-	store, err := creds.Open()
-	if err != nil {
-		u.Fail("Credentials store", err.Error())
 		return err
 	}
 	deps := mcpserver.Build(cfg, store)

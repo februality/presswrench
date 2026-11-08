@@ -35,7 +35,7 @@ func runServe() error {
 	// Session.Close, which would otherwise wait on the check.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	deps, _ := startServeDeps(ctx, cfg, creds.Open)
+	deps, _ := startServeDeps(ctx, cfg, openStore)
 	defer deps.SSHPool.Close()
 	defer deps.Session.Close()
 	defer cancel()

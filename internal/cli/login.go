@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -14,6 +14,35 @@ import (
 	"github.com/februality/presswrench/internal/creds"
 	"github.com/februality/presswrench/internal/ui"
 )
+
+// openStore opens the credential store. Every command goes through it so
+// tests can replace it and never reach the real keychain.
+var openStore = creds.Open
+
+// storeOrBroken is openStore, but a failure becomes a store whose every
+// operation reports that failure, so callers can show the real problem.
+func storeOrBroken() creds.Store {
+	store, err := openStore()
+	if err != nil {
+		return creds.Broken(err)
+	}
+	return store
+}
+
+// degradedStore reports whether the store is a fallback or otherwise worth a warning.
+func degradedStore(info creds.Info) bool {
+	return info.Warning != "" || strings.Contains(info.Description, "keyring unavailable")
+}
+
+// showStore prints which credential store is in use, once per command run.
+func showStore(u *ui.UI, store creds.Store) {
+	info := store.Info()
+	if degradedStore(info) {
+		u.Warn("Credential store "+u.Sep()+" "+info.Description, info.Warning)
+		return
+	}
+	u.Step("Credential store "+u.Sep()+" "+info.Description, "")
+}
 
 func NewLogin() *cobra.Command {
 	var (
@@ -35,11 +64,13 @@ func NewLogin() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			store, err := creds.Open()
+			u := ui.New(os.Stdout, os.Stdin)
+			store, err := openStore()
 			if err != nil {
-				return fmt.Errorf("open credentials store: %w", err)
+				u.Fail("Could not open the credentials store", auth.Explain(err))
+				return ui.Reported(err)
 			}
-			return runLogin(ui.New(os.Stdout, os.Stdin), store, cfg, account, manual)
+			return runLogin(u, store, cfg, account, manual)
 		},
 	}
 	cmd.Flags().StringVar(&account, "account", "", "named account (lowercase slug); omit for the default")
@@ -58,6 +89,7 @@ func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, m
 		Manual:      manual,
 	}
 	detail := "account " + auth.AccountLabel(account)
+	showStore(u, store)
 
 	if manual || !u.Interactive() {
 		lo.OnAuthorizeURL = func(url string, opened bool) {
@@ -87,7 +119,7 @@ func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, m
 			if errors.Is(err, ui.ErrCancelled) {
 				return err
 			}
-			u.Fail(err.Error(), "")
+			u.Fail(auth.Explain(err), "")
 			return ui.Reported(err)
 		}
 		u.Step("Signed in as "+orUnknown(tr.Identity()), detail)
@@ -109,7 +141,7 @@ func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, m
 		tr, err := auth.SignIn(ctx, store, account, lo)
 		if err != nil {
 			signErr = err
-			return ui.Outcome{Level: ui.Fail, Text: err.Error()}
+			return ui.Outcome{Level: ui.Fail, Text: auth.Explain(err)}
 		}
 		return ui.Outcome{Level: ui.Done, Text: "Signed in as " + orUnknown(tr.Identity()) + " · " + detail}
 	})
@@ -135,11 +167,13 @@ func NewLogout() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			store, err := creds.Open()
+			u := ui.New(os.Stdout, os.Stdin)
+			store, err := openStore()
 			if err != nil {
-				return err
+				u.Fail("Could not open the credentials store", auth.Explain(err))
+				return ui.Reported(err)
 			}
-			return signOut(ui.New(os.Stdout, os.Stdin), store, account, cfg.AuthURL)
+			return signOut(u, store, account, cfg.AuthURL)
 		},
 	}
 	cmd.Flags().StringVar(&account, "account", "", "named account (lowercase slug); omit for the default")

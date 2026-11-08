@@ -9,7 +9,6 @@ import (
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/clients"
 	"github.com/februality/presswrench/internal/config"
-	"github.com/februality/presswrench/internal/creds"
 	mcsh "github.com/februality/presswrench/internal/ssh"
 	"github.com/februality/presswrench/internal/ui"
 )
@@ -97,9 +96,10 @@ func NewUninstall() *cobra.Command {
 
 			var credErr error
 			if removeCreds {
-				store, err := creds.Open()
+				store, err := openStore()
 				if err != nil {
-					return err
+					u.Fail("Could not open the credentials store", auth.Explain(err))
+					return ui.Reported(err)
 				}
 				cfg, err := loadConfigFor(account)
 				if err != nil {

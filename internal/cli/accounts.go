@@ -41,8 +41,12 @@ func newAccountsList() *cobra.Command {
 		Use:   "list",
 		Short: "List all configured accounts",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			rows := listAccounts()
+			store := storeOrBroken()
+			rows, listErr := listAccounts(store)
 			if jsonOut {
+				if listErr != nil {
+					fmt.Fprintln(os.Stderr, auth.Explain(listErr))
+				}
 				b, err := json.MarshalIndent(rows, "", "  ")
 				if err != nil {
 					return err
@@ -51,6 +55,10 @@ func newAccountsList() *cobra.Command {
 				return nil
 			}
 			u := ui.New(os.Stdout, os.Stdin)
+			showStore(u, store)
+			if listErr != nil {
+				u.Warn("Could not read the stored sessions", auth.Explain(listErr))
+			}
 			if len(rows) == 0 {
 				u.Skip("No accounts configured", "run presswrench setup")
 				return nil
@@ -97,15 +105,16 @@ func newAccountsRemove() *cobra.Command {
 			if !yes {
 				return fmt.Errorf("destructive: pass --yes to confirm removing account %q", account)
 			}
-			store, err := creds.Open()
+			u := ui.New(os.Stdout, os.Stdin)
+			store, err := openStore()
 			if err != nil {
-				return err
+				u.Fail("Could not open the credentials store", auth.Explain(err))
+				return ui.Reported(err)
 			}
 			authURL := ""
 			if cfg, err := loadConfigFor(account); err == nil {
 				authURL = cfg.AuthURL
 			}
-			u := ui.New(os.Stdout, os.Stdin)
 			if err := removeSession(u, store, account, authURL); err != nil {
 				return err
 			}
@@ -142,10 +151,11 @@ func removeSession(u *ui.UI, store creds.Store, account, authURL string) error {
 }
 
 // listAccounts returns one row per discovered account, unioning the
-// credentials store with every client config's entries.
-func listAccounts() []accountRow {
+// credentials store with every client config's entries. A store that can't
+// be read is reported as the error; the client-config rows are still returned.
+func listAccounts(store creds.Store) ([]accountRow, error) {
 	rows := map[string]*accountRow{}
-	credAccts, _ := creds.ListAccounts()
+	credAccts, listErr := store.Accounts()
 	for _, a := range credAccts {
 		rows[a] = &accountRow{Name: a, HasCredentials: true}
 	}
@@ -169,7 +179,7 @@ func listAccounts() []accountRow {
 		out = append(out, *r)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return out, listErr
 }
 
 func joinSorted(s []string) string {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -19,9 +20,13 @@ import (
 const readOnlyEnvVar = "PRESSWRENCH_READ_ONLY"
 
 type statusOutput struct {
-	Version    string          `json:"version"`
-	BinaryPath string          `json:"binaryPath"`
-	Accounts   []accountStatus `json:"accounts"`
+	Version    string `json:"version"`
+	BinaryPath string `json:"binaryPath"`
+	// Store describes the credential store in use; StoreWarning says why it
+	// is degraded (for example the file fallback), when it is.
+	Store        string          `json:"store"`
+	StoreWarning string          `json:"storeWarning,omitempty"`
+	Accounts     []accountStatus `json:"accounts"`
 	// ReadOnlyEnv reflects PRESSWRENCH_READ_ONLY in the current shell — only useful
 	// if the user happens to have it set when running `status`. The per-
 	// client `readOnly` field is the authoritative signal.
@@ -40,6 +45,9 @@ type sessionStatus struct {
 	SignedIn bool         `json:"signedIn"`
 	Source   creds.Source `json:"source"`
 	Identity string       `json:"identity,omitempty"`
+	// Problem is why the session can't be read when that is not simply
+	// "not signed in" (for example a locked keychain).
+	Problem string `json:"problem,omitempty"`
 }
 
 type sshKeyStatus struct {
@@ -87,9 +95,9 @@ func NewStatus() *cobra.Command {
 
 // discoveredAccounts returns every account name with either a stored
 // session or at least one client-config entry. Default ("") sorts first.
-func discoveredAccounts() []string {
+func discoveredAccounts(store creds.Store) []string {
 	seen := map[string]struct{}{}
-	if accts, err := creds.ListAccounts(); err == nil {
+	if accts, err := store.Accounts(); err == nil {
 		for _, a := range accts {
 			seen[a] = struct{}{}
 		}
@@ -118,24 +126,33 @@ func buildStatus() statusOutput {
 		BinaryPath:  exe,
 		ReadOnlyEnv: config.IsTrueEnv(os.Getenv(readOnlyEnvVar)),
 	}
-	accts := discoveredAccounts()
+	store, err := openStore()
+	if err != nil {
+		store = creds.Broken(err)
+	}
+	info := store.Info()
+	out.Store, out.StoreWarning = info.Description, info.Warning
+	accts := discoveredAccounts(store)
 	if len(accts) == 0 {
 		// No state at all — surface the default account row so `status`
 		// after a fresh install still has something to print.
 		accts = []string{creds.DefaultAccount}
 	}
 	for _, name := range accts {
-		out.Accounts = append(out.Accounts, buildAccountStatus(name))
+		out.Accounts = append(out.Accounts, buildAccountStatus(store, name))
 	}
 	return out
 }
 
-func buildAccountStatus(account string) accountStatus {
+func buildAccountStatus(store creds.Store, account string) accountStatus {
 	as := accountStatus{Name: account}
-	if store, err := creds.Open(); err == nil {
-		sess := auth.NewSession(store, account, config.DefaultAuthURL)
-		src, _ := sess.State()
-		as.Session = sessionStatus{SignedIn: src != creds.SourceNotFound, Source: src, Identity: sess.Identity()}
+	sess := auth.NewSession(store, account, config.DefaultAuthURL)
+	src, err := sess.State()
+	as.Session = sessionStatus{SignedIn: err == nil, Source: src}
+	if err == nil {
+		as.Session.Identity = sess.Identity()
+	} else if !errors.Is(err, auth.ErrLoginRequired) {
+		as.Session.Problem = auth.Explain(err)
 	}
 	keyPath, keyLabel, _ := config.AccountDefaults(account)
 	expanded, _ := config.ExpandHome(keyPath)
@@ -168,13 +185,20 @@ func buildAccountStatus(account string) accountStatus {
 
 func printStatusHuman(u *ui.UI, s statusOutput) {
 	fmt.Printf("presswrench %s\n", s.Version)
-	fmt.Printf("Binary:      %s\n\n", s.BinaryPath)
+	fmt.Printf("Binary:      %s\n", s.BinaryPath)
+	fmt.Printf("Credentials: %s\n", s.Store)
+	if s.StoreWarning != "" {
+		fmt.Printf("             %s %s\n", u.Mark(ui.Warn), s.StoreWarning)
+	}
+	fmt.Println()
 
 	for _, a := range s.Accounts {
 		fmt.Printf("Account: %s\n", auth.AccountLabel(a.Name))
 
 		if a.Session.SignedIn {
 			fmt.Printf("  Session      %s %s (source: %s)\n", u.Mark(ui.Done), orUnknown(a.Session.Identity), a.Session.Source)
+		} else if a.Session.Problem != "" {
+			fmt.Printf("  Session      %s %s\n", u.Mark(ui.Fail), a.Session.Problem)
 		} else {
 			fmt.Printf("  Session      %s Not signed in. Run: %s\n", u.Mark(ui.Fail), auth.LoginCommand(a.Name))
 		}

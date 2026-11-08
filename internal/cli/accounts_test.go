@@ -1,11 +1,12 @@
 package cli
 
 import (
-	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 
 	"github.com/februality/presswrench/internal/clients"
+	"github.com/februality/presswrench/internal/creds"
 )
 
 // withTempHome redirects HOME so patcher constructors compute paths under
@@ -24,8 +25,8 @@ func withTempHome(t *testing.T) string {
 
 func TestListAccounts_DiscoversFromClientConfigs(t *testing.T) {
 	withTempHome(t)
-	// Force the file-fallback creds store under the temp HOME, with no entries.
-	// This means the only accounts we discover come from client configs.
+	// An empty temp store: the only accounts we discover come from client configs.
+	store := creds.NewFileStore(filepath.Join(t.TempDir(), "creds.json"))
 
 	// Patch claude-code with legacy and one named entry.
 	if _, _, err := clients.ByID("claude-code", "").Patch("/usr/local/bin/presswrench", nil, false); err != nil {
@@ -35,7 +36,10 @@ func TestListAccounts_DiscoversFromClientConfigs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows := listAccounts()
+	rows, err := listAccounts(store)
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := map[string]bool{"": false, "acme": false}
 	for _, r := range rows {
 		if _, ok := want[r.Name]; ok {
@@ -54,13 +58,26 @@ func TestListAccounts_DiscoversFromClientConfigs(t *testing.T) {
 	}
 }
 
-// Ensure pristine state doesn't blow up listAccounts.
 func TestListAccounts_EmptyState(t *testing.T) {
 	withTempHome(t)
-	rows := listAccounts()
-	_ = rows // empty or only legacy if a keychain happens to have data; just exercise it
-	// No assertion: this test is about not panicking.
-	if _, err := os.Stat(os.Getenv("HOME")); err != nil {
+	store := creds.NewFileStore(filepath.Join(t.TempDir(), "creds.json"))
+	rows, err := listAccounts(store)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("rows = %+v, err = %v", rows, err)
+	}
+}
+
+func TestListAccounts_StoreErrorStillListsClients(t *testing.T) {
+	withTempHome(t)
+	if _, _, err := clients.ByID("claude-code", "acme").Patch("/usr/local/bin/presswrench", map[string]string{"PRESSWRENCH_ACCOUNT": "acme"}, false); err != nil {
 		t.Fatal(err)
+	}
+	store := creds.Broken(&creds.Error{Kind: creds.KindLocked, Op: "list"})
+	rows, err := listAccounts(store)
+	if err == nil || creds.KindOf(err) != creds.KindLocked {
+		t.Fatalf("err = %v, want a locked-keychain error", err)
+	}
+	if len(rows) != 1 || rows[0].Name != "acme" || rows[0].HasCredentials {
+		t.Fatalf("rows = %+v", rows)
 	}
 }
