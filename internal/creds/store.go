@@ -95,8 +95,8 @@ func DefaultFilePath() (string, error) {
 	return filepath.Join(dir, "credentials.json"), nil
 }
 
-// Open returns the best available Store for this environment: the OS
-// keychain, else the file fallback.
+// ListAccounts opens the store (see Open) and returns its signed-in
+// accounts.
 func ListAccounts() ([]string, error) {
 	store, err := Open()
 	if err != nil {

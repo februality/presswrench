@@ -88,7 +88,6 @@ func NewSession(store creds.Store, account, authURL string) *Session {
 	return s
 }
 
-// Source reports where tokens come from.
 // State reports where the session comes from, or why there is none. It
 // only inspects the environment and the store; it never refreshes.
 func (s *Session) State() (creds.Source, error) {
@@ -111,6 +110,8 @@ func (s *Session) State() (creds.Source, error) {
 	return s.store.Info().Source, nil
 }
 
+// Identity returns the stored "Name <email>" of the signed-in user, or ""
+// when it isn't known or the store can't be read.
 func (s *Session) Identity() string {
 	if s.store == nil {
 		return ""

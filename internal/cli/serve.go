@@ -42,16 +42,11 @@ func runServe() error {
 	return server.ServeStdio(mcpserver.New(deps))
 }
 
-// newServeDeps builds the server dependencies. It never fails: a credential
-// store that cannot be opened becomes a broken store, so every tool explains
-// the problem in its result instead of the server failing to start.
-func newServeDeps(cfg *config.Config, open func() (creds.Store, error)) *mcpserver.Deps {
-	deps, _ := startServeDeps(context.Background(), cfg, open)
-	return deps
-}
-
-// startServeDeps also returns a channel closed when the background session
-// check finishes. The check only inspects the store or env (State): no
+// startServeDeps builds the server dependencies. It never fails: a
+// credential store that cannot be opened becomes a broken store, so every
+// tool explains the problem in its result instead of the server failing to
+// start. The returned channel is closed when the background session check
+// finishes. The check only inspects the store or env (State): no
 // network, no account lock, no refresh.
 func startServeDeps(ctx context.Context, cfg *config.Config, open func() (creds.Store, error)) (*mcpserver.Deps, <-chan struct{}) {
 	var store creds.Store
