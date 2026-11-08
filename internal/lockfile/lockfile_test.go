@@ -195,18 +195,129 @@ func TestRelease_AfterTakeoverKeepsNewHolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	first.Release()
-	b, err := os.ReadFile(p)
-	if err != nil {
+	if _, err := os.Stat(p); err != nil {
 		t.Fatalf("new holder's lock was deleted: %v", err)
 	}
-	if strings.TrimSpace(string(b)) != "second" {
-		t.Errorf("content = %q", b)
+	if r := ReadReason(p); r != "second" {
+		t.Errorf("reason = %q", r)
 	}
 	if err := first.SetReason("late"); err != nil {
 		t.Fatal(err)
 	}
-	b, _ = os.ReadFile(p)
-	if strings.TrimSpace(string(b)) != "second" {
-		t.Errorf("former holder overwrote new lock: %q", b)
+	if r := ReadReason(p); r != "second" {
+		t.Errorf("former holder overwrote new lock: %q", r)
+	}
+	if first.Held() || !second.Held() {
+		t.Errorf("Held: first %v, second %v; want false, true", first.Held(), second.Held())
+	}
+}
+
+func isUnsaved(reason string) bool { return strings.HasPrefix(reason, "unsaved: ") }
+
+func TestAcquireTakingOver_BreaksMatchingReason(t *testing.T) {
+	p := lockPath(t)
+	holder, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	if err := holder.SetReason("unsaved: x"); err != nil {
+		t.Fatal(err)
+	}
+	if !holder.Held() {
+		t.Fatal("holder not Held before takeover")
+	}
+	start := time.Now()
+	taker, err := AcquireTakingOver(context.Background(), p, 10*time.Second, isUnsaved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("takeover waited %v", d)
+	}
+	if holder.Held() || !taker.Held() {
+		t.Errorf("Held: holder %v, taker %v; want false, true", holder.Held(), taker.Held())
+	}
+	holder.Release()
+	if !taker.Held() {
+		t.Error("former holder's Release removed the taker's lock")
+	}
+	taker.Release()
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("taker's Release left the file: %v", err)
+	}
+}
+
+func TestAcquireTakingOver_WaitsForOtherReasons(t *testing.T) {
+	p := lockPath(t)
+	holder, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	if err := holder.SetReason("busy"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = AcquireTakingOver(context.Background(), p, 50*time.Millisecond, isUnsaved)
+	var he *HeldError
+	if !errors.As(err, &he) || he.Reason != "busy" {
+		t.Fatalf("err = %v, want *HeldError with reason busy", err)
+	}
+	if !holder.Held() {
+		t.Error("holder lost a lock that didn't match")
+	}
+}
+
+func TestAcquireTakingOver_OneTakerWins(t *testing.T) {
+	p := lockPath(t)
+	holder, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	if err := holder.SetReason("unsaved: x"); err != nil {
+		t.Fatal(err)
+	}
+	var holders, maxHolders atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := AcquireTakingOver(context.Background(), p, 10*time.Second, isUnsaved)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			n := holders.Add(1)
+			for {
+				m := maxHolders.Load()
+				if n <= m || maxHolders.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			holders.Add(-1)
+			l.Release()
+		}()
+	}
+	wg.Wait()
+	if maxHolders.Load() != 1 {
+		t.Fatalf("max concurrent holders = %d, want 1", maxHolders.Load())
+	}
+}
+
+func TestHeld_NilAndReleased(t *testing.T) {
+	var nl *Lock
+	if nl.Held() {
+		t.Error("nil lock Held")
+	}
+	l, err := Acquire(context.Background(), lockPath(t), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.Release()
+	if l.Held() {
+		t.Error("released lock Held")
 	}
 }
