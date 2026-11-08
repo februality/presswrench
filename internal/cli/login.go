@@ -57,7 +57,7 @@ func runLogin(u *ui.UI, store creds.Store, cfg *config.Config, account string, m
 		OpenBrowser: auth.OpenBrowser,
 		Manual:      manual,
 	}
-	detail := "account " + accountLabel(account)
+	detail := "account " + auth.AccountLabel(account)
 
 	if manual || !u.Interactive() {
 		lo.OnAuthorizeURL = func(url string, opened bool) {
@@ -142,7 +142,7 @@ func NewLogout() *cobra.Command {
 			if err := auth.SignOut(context.Background(), store, account, cfg.AuthURL); err != nil {
 				return err
 			}
-			ui.New(os.Stdout, os.Stdin).Step("Signed out", "account "+accountLabel(account))
+			ui.New(os.Stdout, os.Stdin).Step("Signed out", "account "+auth.AccountLabel(account))
 			return nil
 		},
 	}

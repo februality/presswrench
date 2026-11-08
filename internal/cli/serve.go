@@ -38,17 +38,10 @@ func runServe() error {
 		// Fail fast with instructions rather than registering tools that
 		// can only ever error.
 		if _, err := auth.NewSession(store, cfg.Account, cfg.AuthURL).Token(context.Background()); errors.Is(err, auth.ErrLoginRequired) {
-			return fmt.Errorf("not signed in to Pressable.\n\nRun:\n  %s\n\nor set %s", loginCommand(cfg.Account), auth.EnvAccessToken)
+			return fmt.Errorf("not signed in to Pressable.\n\nRun:\n  %s\n\nor set %s", auth.LoginCommand(cfg.Account), auth.EnvAccessToken)
 		}
 	}
 	deps := mcpserver.Build(cfg, store)
 	defer deps.SSHPool.Close()
 	return server.ServeStdio(mcpserver.New(deps))
-}
-
-func loginCommand(account string) string {
-	if account == "" {
-		return "presswrench login"
-	}
-	return "presswrench login --account " + account
 }

@@ -14,6 +14,7 @@ import (
 
 	"github.com/februality/presswrench/internal/auth"
 	"github.com/februality/presswrench/internal/config"
+	"github.com/februality/presswrench/internal/creds"
 	"github.com/februality/presswrench/internal/gateway"
 	"github.com/februality/presswrench/internal/sites"
 )
@@ -184,6 +185,18 @@ func TestErrResult_LoginRequired(t *testing.T) {
 	res := call(t, handleDiscover(d), nil)
 	if !res.IsError || !strings.Contains(text(res), "presswrench login") {
 		t.Fatalf("got %q", text(res))
+	}
+}
+
+func TestErrResult_StorageErrorIsExplained(t *testing.T) {
+	cerr := &creds.Error{Kind: creds.KindLocked}
+	d := newDeps(&config.Config{}, &fakeGateway{err: cerr})
+	res := call(t, handleDiscover(d), nil)
+	if !res.IsError || text(res) != auth.Explain(cerr) {
+		t.Fatalf("got %q", text(res))
+	}
+	if strings.Contains(text(res), "Not signed in") {
+		t.Errorf("locked keychain reported as signed out: %q", text(res))
 	}
 }
 

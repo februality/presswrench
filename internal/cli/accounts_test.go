@@ -54,15 +54,6 @@ func TestListAccounts_DiscoversFromClientConfigs(t *testing.T) {
 	}
 }
 
-func TestAccountLabel(t *testing.T) {
-	if got := accountLabel(""); got != "default" {
-		t.Errorf("accountLabel(\"\") = %q, want \"default\"", got)
-	}
-	if got := accountLabel("acme"); got != "acme" {
-		t.Errorf("accountLabel(\"acme\") = %q, want \"acme\"", got)
-	}
-}
-
 // Ensure pristine state doesn't blow up listAccounts.
 func TestListAccounts_EmptyState(t *testing.T) {
 	withTempHome(t)

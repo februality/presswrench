@@ -73,7 +73,7 @@ func NewUninstall() *cobra.Command {
 					for _, acct := range accts {
 						unp := clients.ByID(p.ID(), acct)
 						changed, err := unp.Unpatch()
-						label := fmt.Sprintf("%s [%s]", p.DisplayName(), accountLabel(acct))
+						label := fmt.Sprintf("%s [%s]", p.DisplayName(), auth.AccountLabel(acct))
 						if err != nil {
 							u.Fail(label, err.Error())
 							continue
@@ -107,7 +107,7 @@ func NewUninstall() *cobra.Command {
 				}
 				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
 				_ = store.Delete(account)
-				u.Step("Signed out and removed the stored session", "account "+accountLabel(account))
+				u.Step("Signed out and removed the stored session", "account "+auth.AccountLabel(account))
 			}
 
 			if removeKey {
@@ -138,13 +138,4 @@ func NewUninstall() *cobra.Command {
 	cmd.Flags().BoolVar(&removeCreds, "remove-creds", false, "sign out and delete the stored Pressable session (scoped to --account)")
 	cmd.Flags().BoolVar(&removeKey, "remove-key", false, "delete local SSH key files (scoped to --account)")
 	return cmd
-}
-
-// accountLabel renders an account name for human output: "default" for the
-// default account, the name itself otherwise.
-func accountLabel(account string) string {
-	if account == "" {
-		return "default"
-	}
-	return account
 }

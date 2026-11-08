@@ -147,11 +147,8 @@ func jsonText(v any) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText(string(b)), nil
 }
 
-// errResult reports err to the model as a tool error. A missing session
-// gets an actionable message instead of a bare sentinel.
+// errResult reports err to the model as a tool error, as one actionable
+// sentence (see auth.Explain).
 func errResult(err error) (*mcp.CallToolResult, error) {
-	if errors.Is(err, auth.ErrLoginRequired) {
-		return mcp.NewToolResultError("Not signed in to Pressable (or the session expired). Ask the user to run `presswrench login` in a terminal, then retry."), nil
-	}
-	return mcp.NewToolResultError(err.Error()), nil
+	return mcp.NewToolResultError(auth.Explain(err)), nil
 }

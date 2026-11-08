@@ -67,7 +67,7 @@ func newAccountsList() *cobra.Command {
 				}
 				// The mark is one visible cell; pad by hand since it may
 				// carry colour codes.
-				fmt.Printf("%-20s  %s%s  %s\n", accountLabel(r.Name), cred, strings.Repeat(" ", 11), entries)
+				fmt.Printf("%-20s  %s%s  %s\n", auth.AccountLabel(r.Name), cred, strings.Repeat(" ", 11), entries)
 			}
 			return nil
 		},

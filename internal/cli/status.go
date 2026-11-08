@@ -134,7 +134,7 @@ func buildAccountStatus(account string) accountStatus {
 	as := accountStatus{Name: account}
 	if store, err := creds.Open(); err == nil {
 		sess := auth.NewSession(store, account, config.DefaultAuthURL)
-		src := sess.Source()
+		src, _ := sess.State()
 		as.Session = sessionStatus{SignedIn: src != creds.SourceNotFound, Source: src, Identity: sess.Identity()}
 	}
 	keyPath, keyLabel, _ := config.AccountDefaults(account)
@@ -171,12 +171,12 @@ func printStatusHuman(u *ui.UI, s statusOutput) {
 	fmt.Printf("Binary:      %s\n\n", s.BinaryPath)
 
 	for _, a := range s.Accounts {
-		fmt.Printf("Account: %s\n", accountLabel(a.Name))
+		fmt.Printf("Account: %s\n", auth.AccountLabel(a.Name))
 
 		if a.Session.SignedIn {
 			fmt.Printf("  Session      %s %s (source: %s)\n", u.Mark(ui.Done), orUnknown(a.Session.Identity), a.Session.Source)
 		} else {
-			fmt.Printf("  Session      %s Not signed in. Run: %s\n", u.Mark(ui.Fail), loginCommand(a.Name))
+			fmt.Printf("  Session      %s Not signed in. Run: %s\n", u.Mark(ui.Fail), auth.LoginCommand(a.Name))
 		}
 
 		if a.SSHKey.Exists {

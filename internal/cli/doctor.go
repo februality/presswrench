@@ -46,7 +46,7 @@ func runDoctor(u *ui.UI, site string) error {
 
 	var firstErr error
 	for _, account := range accts {
-		fmt.Printf("Account: %s\n", accountLabel(account))
+		fmt.Printf("Account: %s\n", auth.AccountLabel(account))
 		if err := doctorAccount(u, account, site); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -74,14 +74,11 @@ func doctorAccount(u *ui.UI, account, site string) error {
 	defer deps.SSHPool.Close()
 
 	if _, err := deps.Session.Token(ctx); err != nil {
-		if errors.Is(err, auth.ErrLoginRequired) {
-			u.Fail("Not signed in", "run "+loginCommand(account))
-		} else {
-			u.Fail("Session refresh failed", err.Error())
-		}
-		return fmt.Errorf("no usable session for %s", accountLabel(account))
+		u.Fail(auth.Explain(err), "")
+		return fmt.Errorf("no usable session for %s", auth.AccountLabel(account))
 	}
-	u.Step("Signed in as "+orUnknown(deps.Session.Identity()), "source: "+string(deps.Session.Source()))
+	src, _ := deps.Session.State()
+	u.Step("Signed in as "+orUnknown(deps.Session.Identity()), "source: "+string(src))
 
 	var list []sitesList
 	var listErr error

@@ -55,20 +55,28 @@ func NewSession(store creds.Store, account, authURL string) *Session {
 }
 
 // Source reports where tokens come from.
-func (s *Session) Source() creds.Source {
+// State reports where the session comes from, or why there is none. It
+// only inspects the environment and the store; it never refreshes.
+func (s *Session) State() (creds.Source, error) {
 	if s.envToken != "" {
-		return creds.SourceEnv
+		return creds.SourceEnv, nil
 	}
 	if s.store == nil {
-		return creds.SourceNotFound
+		return creds.SourceNotFound, &LoginRequiredError{Account: s.account}
 	}
-	if r, err := s.store.Load(s.account); err != nil || !r.SignedIn() {
-		return creds.SourceNotFound
+	r, err := s.store.Load(s.account)
+	if err != nil {
+		if creds.KindOf(err) == creds.KindNotFound {
+			err = &LoginRequiredError{Account: s.account}
+		}
+		return creds.SourceNotFound, err
 	}
-	return s.store.Info().Source
+	if !r.SignedIn() {
+		return creds.SourceNotFound, &LoginRequiredError{Account: s.account}
+	}
+	return s.store.Info().Source, nil
 }
 
-// Identity returns the stored "Name <email>" of the signed-in user, or "".
 func (s *Session) Identity() string {
 	if s.store == nil {
 		return ""
@@ -83,7 +91,7 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 		return s.envToken, nil
 	}
 	if s.store == nil {
-		return "", ErrLoginRequired
+		return "", &LoginRequiredError{Account: s.account}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -115,8 +123,11 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 	}
 
 	stored, err := s.store.Load(s.account)
+	if err != nil && creds.KindOf(err) != creds.KindNotFound {
+		return "", err
+	}
 	if err != nil || stored.ClientID == "" || stored.RefreshToken == "" {
-		return "", ErrLoginRequired
+		return "", &LoginRequiredError{Account: s.account}
 	}
 	clientID, refresh := stored.ClientID, stored.RefreshToken
 	tr, err := Refresh(ctx, s.http, s.authURL, clientID, refresh)
@@ -132,7 +143,7 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 			tr, err = Refresh(ctx, s.http, s.authURL, clientID, again.RefreshToken)
 		}
 		if errors.As(err, &oe) && oe.Code == "invalid_grant" {
-			return "", ErrLoginRequired
+			return "", &LoginRequiredError{Account: s.account, Expired: true}
 		}
 	}
 	if err != nil {

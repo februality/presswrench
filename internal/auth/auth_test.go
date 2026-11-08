@@ -341,8 +341,8 @@ func TestSession_LoginRequired(t *testing.T) {
 	if _, err := s.Token(context.Background()); !errors.Is(err, ErrLoginRequired) {
 		t.Fatalf("err = %v", err)
 	}
-	if s.Source() != creds.SourceNotFound {
-		t.Errorf("source = %v", s.Source())
+	if src, err := s.State(); src != creds.SourceNotFound || !errors.Is(err, ErrLoginRequired) {
+		t.Errorf("State = %v, %v", src, err)
 	}
 }
 
@@ -352,8 +352,8 @@ func TestSession_EnvToken(t *testing.T) {
 	if tok, err := s.Token(context.Background()); err != nil || tok != "env-token" {
 		t.Fatalf("Token = %q, %v", tok, err)
 	}
-	if s.Source() != creds.SourceEnv {
-		t.Errorf("source = %v", s.Source())
+	if src, err := s.State(); src != creds.SourceEnv || err != nil {
+		t.Errorf("State = %v, %v", src, err)
 	}
 }
 
@@ -460,5 +460,61 @@ func TestLogin_ReportsBrowserOpened(t *testing.T) {
 				t.Fatalf("url=%q opened=%v want %v", gotURL, gotOpened, c.want)
 			}
 		})
+	}
+}
+
+// faultyStore wraps a real store with injectable failures. loadErr fails
+// every Load; saveErrs are consumed one per Save call (nil entry = succeed).
+type faultyStore struct {
+	creds.Store
+	loadErr  error
+	saveErrs []error
+	saves    int
+}
+
+func (f *faultyStore) Load(account string) (creds.Record, error) {
+	if f.loadErr != nil {
+		return creds.Record{}, f.loadErr
+	}
+	return f.Store.Load(account)
+}
+
+func (f *faultyStore) Save(account string, r creds.Record) error {
+	f.saves++
+	if len(f.saveErrs) > 0 {
+		err := f.saveErrs[0]
+		f.saveErrs = f.saveErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
+	return f.Store.Save(account, r)
+}
+
+func TestSession_LockedKeychainIsNotLoginRequired(t *testing.T) {
+	t.Setenv(EnvAccessToken, "")
+	locked := &creds.Error{Kind: creds.KindLocked, Account: "acme"}
+	fs := &faultyStore{Store: newStore(t), loadErr: locked}
+	s := NewSession(fs, "acme", "http://unused")
+	_, err := s.Token(context.Background())
+	if creds.KindOf(err) != creds.KindLocked || errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("Token err = %v", err)
+	}
+	if _, serr := s.State(); creds.KindOf(serr) != creds.KindLocked || errors.Is(serr, ErrLoginRequired) {
+		t.Fatalf("State err = %v", serr)
+	}
+}
+
+func TestSession_InvalidGrantIsExpired(t *testing.T) {
+	f, srv := newFakeAS(t)
+	s, store := signedInSession(t, f, srv)
+	expire(t, store, "")
+	f.mu.Lock()
+	f.refresh = map[string]bool{}
+	f.mu.Unlock()
+	_, err := s.Token(context.Background())
+	var lr *LoginRequiredError
+	if !errors.As(err, &lr) || !lr.Expired || !errors.Is(err, ErrLoginRequired) {
+		t.Fatalf("err = %v", err)
 	}
 }
