@@ -5,6 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -129,5 +132,81 @@ func TestRelease_Idempotent(t *testing.T) {
 	l.Release()
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Fatalf("lock file still present: %v", err)
+	}
+}
+
+func TestAcquire_StaleBreakContention(t *testing.T) {
+	p := lockPath(t)
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	var holders, maxHolders atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := Acquire(context.Background(), p, 10*time.Second)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			n := holders.Add(1)
+			for {
+				m := maxHolders.Load()
+				if n <= m || maxHolders.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			holders.Add(-1)
+			l.Release()
+		}()
+	}
+	wg.Wait()
+	if maxHolders.Load() != 1 {
+		t.Fatalf("max concurrent holders = %d, want 1", maxHolders.Load())
+	}
+}
+
+func TestRelease_AfterTakeoverKeepsNewHolder(t *testing.T) {
+	p := lockPath(t)
+	first, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatalf("takeover: %v", err)
+	}
+	defer second.Release()
+	if err := second.SetReason("second"); err != nil {
+		t.Fatal(err)
+	}
+	first.Release()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("new holder's lock was deleted: %v", err)
+	}
+	if strings.TrimSpace(string(b)) != "second" {
+		t.Errorf("content = %q", b)
+	}
+	if err := first.SetReason("late"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(p)
+	if strings.TrimSpace(string(b)) != "second" {
+		t.Errorf("former holder overwrote new lock: %q", b)
 	}
 }

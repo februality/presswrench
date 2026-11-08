@@ -41,6 +41,7 @@ func (e *HeldError) Error() string {
 // Lock is a held lockfile.
 type Lock struct {
 	path string
+	id   os.FileInfo // identity of the file we created
 	stop chan struct{}
 	done chan struct{}
 
@@ -60,17 +61,29 @@ func Acquire(ctx context.Context, path string, wait time.Duration) (*Lock, error
 	for {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
+			info, serr := f.Stat()
 			_ = f.Close() // close before Chtimes/Remove (Windows)
-			l := &Lock{path: path, stop: make(chan struct{}), done: make(chan struct{})}
+			if serr != nil {
+				_ = os.Remove(path)
+				return nil, fmt.Errorf("Could not inspect lock %s: %w", path, serr)
+			}
+			l := &Lock{path: path, id: info, stop: make(chan struct{}), done: make(chan struct{})}
 			go l.beat(Heartbeat)
 			return l, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("Could not create lock %s: %w", path, err)
 		}
-		if st, serr := os.Stat(path); serr == nil && time.Since(st.ModTime()) > StaleAfter {
-			_ = os.Remove(path)
+		st, serr := os.Stat(path)
+		if errors.Is(serr, os.ErrNotExist) {
+			continue // released between our create and stat: retry at once
+		}
+		if serr == nil && time.Since(st.ModTime()) > StaleAfter {
+			breakStale(path, st)
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if !time.Now().Before(deadline) {
 			reason := ""
@@ -87,6 +100,38 @@ func Acquire(ctx context.Context, path string, wait time.Duration) (*Lock, error
 	}
 }
 
+// breakerStale is how old a ".break" file must be to be treated as left
+// behind by a crashed breaker.
+const breakerStale = 5 * time.Second
+
+// breakStale removes the stale lock at path, serialized through a short-lived
+// ".break" file so two waiters cannot both judge the same stale file and have
+// the slower one delete the faster one's fresh lock. Under the breaker it
+// re-checks that path is still the file judged stale and still stale.
+func breakStale(path string, judged os.FileInfo) {
+	bp := path + ".break"
+	f, err := os.OpenFile(bp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if st, serr := os.Stat(bp); serr == nil && time.Since(st.ModTime()) > breakerStale {
+			_ = os.Remove(bp)
+		}
+		return
+	}
+	_ = f.Close()
+	defer func() { _ = os.Remove(bp) }()
+	cur, err := os.Stat(path)
+	if err != nil || !os.SameFile(judged, cur) || time.Since(cur.ModTime()) <= StaleAfter {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+// ours reports whether path is still the file this lock created.
+func (l *Lock) ours() bool {
+	cur, err := os.Stat(l.path)
+	return err == nil && os.SameFile(l.id, cur)
+}
+
 func (l *Lock) beat(every time.Duration) {
 	defer close(l.done)
 	t := time.NewTicker(every)
@@ -97,10 +142,12 @@ func (l *Lock) beat(every time.Duration) {
 			return
 		case <-t.C:
 			l.mu.Lock()
-			if !l.released {
-				now := time.Now()
-				_ = os.Chtimes(l.path, now, now)
+			if l.released || !l.ours() {
+				l.mu.Unlock()
+				return // lock was taken over (e.g. after a long stall)
 			}
+			now := time.Now()
+			_ = os.Chtimes(l.path, now, now)
 			l.mu.Unlock()
 		}
 	}
@@ -112,7 +159,7 @@ func (l *Lock) SetReason(reason string) error {
 	reason = strings.TrimSpace(strings.ReplaceAll(reason, "\n", " "))
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.released {
+	if l.released || !l.ours() {
 		return nil
 	}
 	return os.WriteFile(l.path, []byte(reason+"\n"), 0o600)
@@ -125,7 +172,9 @@ func (l *Lock) Release() {
 		<-l.done
 		l.mu.Lock()
 		l.released = true
-		_ = os.Remove(l.path)
+		if l.ours() {
+			_ = os.Remove(l.path)
+		}
 		l.mu.Unlock()
 	})
 }
