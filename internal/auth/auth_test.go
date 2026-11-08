@@ -460,6 +460,7 @@ type faultyStore struct {
 	saves     int
 	deleteErr error
 	saveDelay time.Duration // a slow keychain
+	saveBlock chan struct{} // when set, Save waits until it's closed (a hung keychain)
 
 	mu sync.Mutex // guards loadErr (via setLoadErr), saveErrs, saves, saveDelay
 }
@@ -501,9 +502,12 @@ func (f *faultyStore) Save(account string, r creds.Record) error {
 		err = f.saveErrs[0]
 		f.saveErrs = f.saveErrs[1:]
 	}
-	delay := f.saveDelay
+	delay, block := f.saveDelay, f.saveBlock
 	f.mu.Unlock()
 	time.Sleep(delay)
+	if block != nil {
+		<-block
+	}
 	if err != nil {
 		return err
 	}
@@ -562,8 +566,22 @@ func pendingSession(t *testing.T, saveErrs []error) (*Session, *faultyStore, *fa
 	fs := &faultyStore{Store: store, saveErrs: saveErrs}
 	s := NewSession(fs, "", srv.URL)
 	s.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
-	t.Cleanup(s.Close)
+	t.Cleanup(func() { closeAndSettle(t, s) })
 	return s, fs, f, srv
+}
+
+// closeAndSettle closes s and waits for a background flush still in flight
+// (Close leaves the lock to it) so it can't write into a removed temp dir.
+func closeAndSettle(t *testing.T, s *Session) {
+	s.Close()
+	settled := eventually(func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !s.flushing
+	})
+	if !settled {
+		t.Error("background flush still running 5 s after Close")
+	}
 }
 
 // advance moves the session's clock forward by d.
@@ -572,6 +590,18 @@ func advance(s *Session, d time.Duration) {
 	defer s.mu.Unlock()
 	old := s.now
 	s.now = func() time.Time { return old().Add(d) }
+}
+
+// runRetry runs the pending session's background retry now, as its timer
+// would, and returns when that attempt has settled. pendingRetry stays long
+// in the tests that use it, so the real timer never fires alongside.
+func runRetry(s *Session) {
+	s.mu.Lock()
+	t := s.retry
+	s.mu.Unlock()
+	if t != nil {
+		s.retryTick(func() *time.Timer { return t })
+	}
 }
 
 // isPending reports whether s holds an unsaved session.
@@ -663,7 +693,7 @@ func TestSession_PendingFlushedWhenStoreRecovers(t *testing.T) {
 	if r, _ := fs.Store.Load(""); r.RefreshToken == "refresh-2" {
 		t.Fatal("saved although every attempt failed")
 	}
-	advance(s, pendingRetry)
+	runRetry(s)
 	again, err := s.Token(context.Background())
 	if err != nil || again != tok {
 		t.Fatalf("Token = %q, %v; want %q", again, err, tok)
@@ -691,7 +721,7 @@ func TestSession_PendingDiscardedWhenSuperseded(t *testing.T) {
 	if err := fs.Store.Save("", r); err != nil { // another writer, bypassing the lock
 		t.Fatal(err)
 	}
-	advance(s, pendingRetry)
+	runRetry(s)
 	tok, err := s.Token(context.Background())
 	if err != nil || tok != "access-from-login" {
 		t.Fatalf("Token = %q, %v; want the newer stored session", tok, err)
@@ -717,7 +747,7 @@ func TestSession_PartialSaveCountsAsFlushed(t *testing.T) {
 		t.Fatal(err)
 	}
 	saves := fs.saveCount()
-	advance(s, pendingRetry)
+	runRetry(s)
 	if again, err := s.Token(context.Background()); err != nil || again != tok {
 		t.Fatalf("Token = %q, %v; want %q", again, err, tok)
 	}
@@ -739,7 +769,7 @@ func TestSession_DeniedNotRetried(t *testing.T) {
 	}
 }
 
-func TestSession_SlowKindsSavedOnceAndThrottled(t *testing.T) {
+func TestSession_SlowKindsSavedOnce(t *testing.T) {
 	for _, k := range []creds.Kind{creds.KindTimeout, creds.KindLocked} {
 		t.Run(fmt.Sprint(k), func(t *testing.T) {
 			s, fs, _, _ := pendingSession(t, failSaves(100, k))
@@ -750,21 +780,82 @@ func TestSession_SlowKindsSavedOnceAndThrottled(t *testing.T) {
 			if n := fs.saveCount(); n != 1 {
 				t.Errorf("saves = %d, want 1 (the call already waited)", n)
 			}
-			advance(s, pendingRetry/2)
+			advance(s, pendingRetry)
 			if again, err := s.Token(context.Background()); err != nil || again != tok {
 				t.Fatalf("Token = %q, %v", again, err)
 			}
 			if n := fs.saveCount(); n != 1 {
-				t.Errorf("saves = %d after a Token within pendingRetry, want 1", n)
+				t.Errorf("saves = %d; Token tried to save in the foreground", n)
 			}
-			advance(s, pendingRetry)
-			if _, err := s.Token(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			runRetry(s)
 			if n := fs.saveCount(); n != 2 {
-				t.Errorf("saves = %d after pendingRetry, want 2", n)
+				t.Errorf("saves = %d after a background retry, want 2", n)
 			}
 		})
+	}
+}
+
+// A save that hangs for longer than pendingRetry (an unanswered keychain
+// prompt) must not hold up Token: the background retry makes it without
+// the session mutex.
+func TestSession_HungSaveDoesNotBlockToken(t *testing.T) {
+	old := pendingRetry
+	pendingRetry = 20 * time.Millisecond
+	t.Cleanup(func() { pendingRetry = old })
+	s, fs, _, _ := pendingSession(t, failSaves(3, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	var unblock sync.Once
+	release := func() { unblock.Do(func() { close(block) }) }
+	t.Cleanup(release)
+	fs.mu.Lock()
+	fs.saveBlock = block
+	fs.mu.Unlock()
+	if !eventually(func() bool { return fs.saveCount() > 3 }) {
+		t.Fatal("background retry never started a save")
+	}
+	deadline := time.Now().Add(5 * pendingRetry) // well past pendingRetry, save still hung
+	for time.Now().Before(deadline) {
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				start := time.Now()
+				got, err := s.Token(context.Background())
+				if d := time.Since(start); d > 200*time.Millisecond {
+					t.Errorf("Token took %v while the save hung", d)
+				}
+				if err != nil || got != tok {
+					t.Errorf("Token = %q, %v; want %q", got, err, tok)
+				}
+			}()
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			release()
+			t.Fatal("Token blocked behind the hung save")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !isPending(s) {
+		t.Fatal("settled while the save was still hung")
+	}
+	release()
+	if !eventually(func() bool { return !isPending(s) }) {
+		t.Fatal("pending session not saved after the keychain answered")
+	}
+	if r, _ := fs.Store.Load(""); r.RefreshToken != "refresh-2" {
+		t.Errorf("stored refresh token = %q, want refresh-2", r.RefreshToken)
+	}
+	if !lockFree(t) {
+		t.Error("lock still held after the save")
 	}
 }
 
@@ -854,9 +945,9 @@ func TestSession_InvalidateWhilePendingUsesPendingRefreshToken(t *testing.T) {
 	fs.mu.Lock()
 	fs.saveErrs = nil
 	fs.mu.Unlock()
-	advance(s, pendingRetry)
-	if _, err := s.Token(context.Background()); err != nil {
-		t.Fatal(err)
+	runRetry(s) // the pending refresh also brought the timer forward; either saves
+	if !eventually(func() bool { return !isPending(s) }) {
+		t.Fatal("not saved after the store recovered")
 	}
 	if r, _ := fs.Store.Load(""); r.RefreshToken != "refresh-3" || r.AccessToken != again {
 		t.Errorf("stored = %q/%q, want refresh-3/%q", r.RefreshToken, r.AccessToken, again)
@@ -919,7 +1010,7 @@ func TestSession_FlushStoredRecordStates(t *testing.T) {
 			t.Fatal(err)
 		}
 		fs.setLoadErr(&creds.Error{Kind: creds.KindCorrupt, Op: "load"})
-		advance(s, pendingRetry)
+		runRetry(s)
 		if again, err := s.Token(context.Background()); err != nil || again != tok {
 			t.Fatalf("Token = %q, %v", again, err)
 		}
@@ -938,7 +1029,7 @@ func TestSession_FlushStoredRecordStates(t *testing.T) {
 		}
 		fs.setLoadErr(&creds.Error{Kind: creds.KindNewerFormat, Op: "load"})
 		saves := fs.saveCount()
-		advance(s, pendingRetry)
+		runRetry(s)
 		if _, err := s.Token(context.Background()); creds.KindOf(err) != creds.KindNewerFormat {
 			t.Fatalf("err = %v, want the newer-format error", err)
 		}
@@ -954,7 +1045,7 @@ func TestSession_FlushStoredRecordStates(t *testing.T) {
 		if err := fs.Store.Delete(""); err != nil {
 			t.Fatal(err)
 		}
-		advance(s, pendingRetry)
+		runRetry(s)
 		if _, err := s.Token(context.Background()); !errors.Is(err, ErrLoginRequired) {
 			t.Fatalf("err = %v, want login required", err)
 		}
@@ -984,10 +1075,11 @@ func TestSession_LoginTakesOverPendingLock(t *testing.T) {
 		t.Fatalf("stored after login = %+v, %v", login, err)
 	}
 	saves := fs.saveCount()
-	// Real clock (the login's access token is fresh) and a flush due now.
+	// Real clock: the login's access token is fresh.
 	s.mu.Lock()
-	s.now, s.lastFlush = time.Now, time.Time{}
+	s.now = time.Now
 	s.mu.Unlock()
+	runRetry(s)
 	tok, err := s.Token(context.Background())
 	if err != nil || tok != login.AccessToken {
 		t.Fatalf("Token = %q, %v; want the login's %q", tok, err, login.AccessToken)
@@ -1015,7 +1107,7 @@ func TestSession_LogoutTakesOverPendingLock(t *testing.T) {
 	if d := time.Since(start); d > lockWait/4 {
 		t.Errorf("logout took %v", d)
 	}
-	advance(s, pendingRetry)
+	runRetry(s)
 	if _, err := s.Token(context.Background()); !errors.Is(err, ErrLoginRequired) {
 		t.Fatalf("err = %v, want login required after logout", err)
 	}
@@ -1089,7 +1181,7 @@ func TestSession_TakenOverLockNotWrittenUnder(t *testing.T) {
 		t.Fatal(err)
 	}
 	saves := fs.saveCount()
-	advance(s, pendingRetry)
+	runRetry(s)
 	if again, err := s.Token(context.Background()); err != nil || again != tok {
 		t.Errorf("Token = %q, %v; want the in-memory %q while the taker holds the lock", again, err, tok)
 	}
@@ -1115,7 +1207,7 @@ func TestSession_TakenOverLockRegainedAndSaved(t *testing.T) {
 		t.Fatal(err)
 	}
 	taker.Release()
-	advance(s, pendingRetry)
+	runRetry(s)
 	if again, err := s.Token(context.Background()); err != nil || again != tok {
 		t.Fatalf("Token = %q, %v", again, err)
 	}
@@ -1124,5 +1216,41 @@ func TestSession_TakenOverLockRegainedAndSaved(t *testing.T) {
 	}
 	if isPending(s) || !lockFree(t) {
 		t.Error("not settled after regaining the lock")
+	}
+}
+
+// A pending session that must refresh after a user command took its lock
+// settles first and never spends its refresh token without the lock.
+func TestSession_TakenOverLockNotRefreshedWithout(t *testing.T) {
+	old := relockWait
+	relockWait = 100 * time.Millisecond
+	t.Cleanup(func() { relockWait = old })
+	s, fs, f, _ := pendingSession(t, failSaves(100, creds.KindOther))
+	tok, err := s.Token(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	taker, err := lockAccountForUser(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taker.Release()
+	saves := fs.saveCount()
+	s.Invalidate(tok)
+	shortLockWait(t, 100*time.Millisecond)
+	_, err = s.Token(context.Background())
+	var held *lockfile.HeldError
+	if !errors.As(err, &held) {
+		t.Fatalf("err = %v, want *lockfile.HeldError (the taker holds the account)", err)
+	}
+	f.mu.Lock()
+	attempts := f.refreshAttempts
+	f.mu.Unlock()
+	if attempts != 1 || fs.saveCount() != saves || isPending(s) {
+		t.Errorf("refresh attempts = %d, saves %d -> %d, pending = %v; want 1, unchanged, false",
+			attempts, saves, fs.saveCount(), isPending(s))
+	}
+	if !taker.Held() {
+		t.Error("the taker lost its lock")
 	}
 }

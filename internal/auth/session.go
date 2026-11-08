@@ -48,15 +48,14 @@ type Session struct {
 	// pending != nil this process holds the account lock in held (unless a
 	// user command took it over; see flushOnce), and spent is the refresh
 	// token it exchanged (what the store still holds).
-	pending   *creds.Record
-	spent     string
-	held      *lockfile.Lock
-	reason    string      // held's lock reason
-	retry     *time.Timer // background save retry
-	lastFlush time.Time   // last save attempt of pending, by s.now
-	flushing  bool        // a background flush is running without s.mu
-	idle      *sync.Cond  // on s.mu; broadcast when flushing ends
-	closed    bool
+	pending  *creds.Record
+	spent    string
+	held     *lockfile.Lock
+	reason   string      // held's lock reason
+	retry    *time.Timer // background save retry
+	flushing bool        // a flush is running without s.mu (see flushUnlocked)
+	idle     *sync.Cond  // on s.mu; broadcast when flushing ends
+	closed   bool
 }
 
 // errSessionClosed is returned by Token after Close.
@@ -122,10 +121,10 @@ func (s *Session) Identity() string {
 
 // Token returns a valid access token, refreshing if necessary.
 //
-// While a rotated session is unsaved (see persist), Token serves the
-// in-memory access token, retries the save at most once per pendingRetry
-// (the background timer covers the rest), and refreshes with the in-memory
-// refresh token under the account lock it still holds.
+// While a rotated session is unsaved (see persist), Token never touches
+// the store: it serves the in-memory access token, or refreshes with the
+// in-memory refresh token under the account lock it still holds. Saving is
+// left to the background retry, so a hung keychain never stalls it.
 func (s *Session) Token(ctx context.Context) (string, error) {
 	if s.envToken != "" {
 		return s.envToken, nil
@@ -140,30 +139,30 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 	}
 
 	now := s.now()
-	if s.pending != nil && !s.flushing && now.Sub(s.lastFlush) >= pendingRetry {
-		s.flushLocked(ctx)
-	}
 	if s.validLocked(now) {
 		return s.access, nil
 	}
 	if s.pending != nil {
-		for s.flushing { // never refresh or save alongside a background save
+		for s.flushing { // never refresh alongside a save in flight
 			s.idle.Wait()
 		}
 		if s.closed {
 			return "", errSessionClosed
 		}
 		if s.pending != nil && !s.held.Held() {
-			s.flushLocked(ctx) // a user command took the lock: settle first
+			// A user command took the lock: settle before spending a
+			// refresh token (which a partial save may have stored).
+			s.flushUnlocked(ctx)
+			if s.closed {
+				return "", errSessionClosed
+			}
+		}
+		now = s.now() // we may have waited
+		if s.validLocked(now) {
+			return s.access, nil // another caller refreshed, or the store is newer
 		}
 		if s.pending != nil {
-			if tok, err := s.refreshPendingLocked(ctx, now); err != nil || tok != "" {
-				return tok, err
-			}
-			// Superseded while refreshing: fall through to the stored session.
-		}
-		if s.validLocked(now) {
-			return s.access, nil
+			return s.refreshPendingLocked(ctx, now)
 		}
 	}
 
@@ -257,7 +256,6 @@ func (s *Session) persist(ctx context.Context, base creds.Record, tr *TokenRespo
 	slog.Error("Could not save the refreshed Pressable session; keeping it in memory and holding the account lock until it saves",
 		"account", AccountLabel(s.account), "error", Explain(err))
 	s.pending, s.spent, s.held = &r, base.RefreshToken, lock
-	s.lastFlush = now
 	s.reason = fmt.Sprintf("%saccount %s: %s Sign in again with `%s` to replace it.",
 		unsavedPrefix, AccountLabel(s.account), sentence(Explain(err)), LoginCommand(s.account))
 	if serr := s.held.SetReason(s.reason); serr != nil {
@@ -298,8 +296,8 @@ func (s *Session) saveWithRetry(ctx context.Context, r creds.Record) error {
 
 // refreshPendingLocked refreshes an unsaved session with its in-memory
 // refresh token (the store's one is already spent) under the lock still in
-// s.held, then tries to save the result like any flush. It returns "" with
-// no error when that flush found a newer stored session.
+// s.held. The result replaces pending and the background retry is brought
+// forward to save it.
 func (s *Session) refreshPendingLocked(ctx context.Context, now time.Time) (string, error) {
 	p := *s.pending
 	tr, err := Refresh(ctx, s.http, s.authURL, p.ClientID, p.RefreshToken)
@@ -321,7 +319,9 @@ func (s *Session) refreshPendingLocked(ctx context.Context, now time.Time) (stri
 	s.access = tr.AccessToken
 	s.expiry = now.Add(time.Duration(tr.ExpiresIn) * time.Second)
 	s.bad = ""
-	s.flushLocked(ctx)
+	if s.retry != nil {
+		s.retry.Reset(0)
+	}
 	return s.access, nil
 }
 
@@ -376,11 +376,20 @@ func (s *Session) flushOnce(ctx context.Context, p *creds.Record, spent string, 
 	return flushSaved, held
 }
 
-// flushLocked runs flushOnce under s.mu and applies its outcome.
-func (s *Session) flushLocked(ctx context.Context) {
-	s.lastFlush = s.now()
-	p := s.pending
-	res, lock := s.flushOnce(ctx, p, s.spent, s.held, s.reason)
+// flushUnlocked runs one flushOnce of the pending session without s.mu, so
+// slow keychain calls never block Token serving the in-memory token, and
+// applies its outcome. The caller holds s.mu (released meanwhile and held
+// again on return), s.pending != nil and !s.flushing. While flushing, Token
+// doesn't refresh and Close leaves the lock to the settle step, so nothing
+// replaces pending underneath it.
+func (s *Session) flushUnlocked(ctx context.Context) {
+	p, spent, held, reason := s.pending, s.spent, s.held, s.reason
+	s.flushing = true
+	s.mu.Unlock()
+	res, lock := s.flushOnce(ctx, p, spent, held, reason)
+	s.mu.Lock()
+	s.flushing = false
+	s.idle.Broadcast()
 	s.settleFlushLocked(p, res, lock)
 }
 
@@ -445,28 +454,18 @@ func (s *Session) scheduleRetryLocked() {
 	s.retry = t
 }
 
-// retryTick is one background save attempt. The keychain calls run without
-// s.mu so a hung keychain doesn't block Token serving the in-memory token;
-// Token waits (s.idle) before it refreshes or saves itself.
+// retryTick is one background save attempt, the only retry path while a
+// session is unsaved.
 func (s *Session) retryTick(timer func() *time.Timer) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	t := timer()
-	if s.retry != t || s.pending == nil || s.closed || s.flushing {
-		s.mu.Unlock()
+	if s.retry != t || s.pending == nil || s.closed {
 		return
 	}
-	p, spent, held, reason := s.pending, s.spent, s.held, s.reason
-	s.flushing = true
-	s.lastFlush = s.now()
-	s.mu.Unlock()
-
-	res, lock := s.flushOnce(context.Background(), p, spent, held, reason)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.flushing = false
-	s.idle.Broadcast()
-	s.settleFlushLocked(p, res, lock)
+	if !s.flushing { // else Token is settling a lost lock; try again later
+		s.flushUnlocked(context.Background())
+	}
 	if s.pending != nil && s.retry == t {
 		t.Reset(pendingRetry)
 	}
