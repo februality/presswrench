@@ -121,3 +121,12 @@ func TestRememberBackend_WritesMarker(t *testing.T) {
 		t.Fatalf("broken store changed marker: %q", b)
 	}
 }
+
+func TestOverride(t *testing.T) {
+	for env, want := range map[string]string{"": "", "file": "file", " KeyRing\n": "keyring", "bogus": ""} {
+		t.Setenv(EnvCredentialStore, env)
+		if got := Override(); got != want {
+			t.Errorf("Override() with %q = %q, want %q", env, got, want)
+		}
+	}
+}

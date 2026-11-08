@@ -54,6 +54,10 @@ func startServeDeps(ctx context.Context, cfg *config.Config, open func() (creds.
 		var err error
 		if store, err = open(); err != nil {
 			store = creds.Broken(err)
+		} else if w := store.Info().Warning; w != "" {
+			// E.g. the MCP client's env forces another store than the one
+			// used at sign-in: tools will say "not signed in".
+			slog.Warn("Credential store warning", "detail", w)
 		}
 	}
 	deps := mcpserver.Build(cfg, store)

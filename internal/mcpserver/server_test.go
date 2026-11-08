@@ -287,3 +287,33 @@ func TestGatewayTool_NotSignedInExplains(t *testing.T) {
 		t.Fatalf("got %q", text(res))
 	}
 }
+
+// warnStore reports a store warning (an override hiding the sign-in store).
+type warnStore struct{ creds.Store }
+
+const overrideWarning = "PRESSWRENCH_CREDENTIAL_STORE=file overrides the keyring store used at sign-in; sessions saved there aren't visible."
+
+func (w warnStore) Info() creds.Info {
+	i := w.Store.Info()
+	i.Warning = overrideWarning
+	return i
+}
+
+func TestNotSignedIn_ToolResultsCarryStoreWarning(t *testing.T) {
+	store := warnStore{creds.NewFileStore(t.TempDir() + "/creds.json")}
+	sess := auth.NewSession(store, "dev", "http://127.0.0.1:1")
+	d := newDeps(&config.Config{SSHKeyPath: "/nonexistent/key"}, nil)
+	d.Session = sess
+	d.Gateway = &sessionGateway{session: sess}
+	res := call(t, handleDiscover(d), nil)
+	if !res.IsError || !strings.Contains(text(res), overrideWarning) {
+		t.Errorf("discover = %q, want the store warning", text(res))
+	}
+	var st sshStatus
+	if err := json.Unmarshal([]byte(text(call(t, handleSSHStatus(d), nil))), &st); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(st.Session, overrideWarning) || !strings.Contains(st.Session, "presswrench login --account dev") {
+		t.Errorf("ssh_status session = %q", st.Session)
+	}
+}

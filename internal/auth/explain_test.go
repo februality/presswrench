@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/februality/presswrench/internal/creds"
@@ -45,5 +46,40 @@ func TestExplain(t *testing.T) {
 		if got := Explain(c.err); got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+// setLoginEnv makes LoginCommand see a credential-store override.
+func setLoginEnv(t *testing.T, v string) {
+	t.Helper()
+	old := loginEnv
+	loginEnv = func() string { return v }
+	t.Cleanup(func() { loginEnv = old })
+}
+
+func TestLoginCommand_RepeatsStoreOverride(t *testing.T) {
+	setLoginEnv(t, "file")
+	want := "PRESSWRENCH_CREDENTIAL_STORE=file presswrench login --account dev"
+	if runtime.GOOS == "windows" {
+		want = `$env:PRESSWRENCH_CREDENTIAL_STORE="file"; presswrench login --account dev`
+	}
+	if got := LoginCommand("dev"); got != want {
+		t.Errorf("LoginCommand = %q, want %q", got, want)
+	}
+	if got := Explain(&LoginRequiredError{Account: "dev"}); !strings.Contains(got, "`"+want+"`") {
+		t.Errorf("Explain = %q, want it to give %q", got, want)
+	}
+	// The keyring-unavailable hint already says to set the variable.
+	got := Explain(&creds.Error{Kind: creds.KindUnavailable, Detail: "no dbus"})
+	if strings.Count(got, "PRESSWRENCH_CREDENTIAL_STORE") != 1 {
+		t.Errorf("Explain(unavailable) = %q", got)
+	}
+}
+
+func TestExplain_LoginRequiredCarriesStoreWarning(t *testing.T) {
+	w := "PRESSWRENCH_CREDENTIAL_STORE=file overrides the keyring store used at sign-in; sessions saved there aren't visible."
+	got := Explain(&LoginRequiredError{Account: "dev", StoreWarning: w})
+	if !strings.HasPrefix(got, "Not signed in to Pressable (account dev).") || !strings.HasSuffix(got, " "+w) {
+		t.Errorf("Explain = %q", got)
 	}
 }

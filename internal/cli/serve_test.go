@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -114,5 +116,22 @@ func TestStartServeDeps_EnvTokenOpensNoStore(t *testing.T) {
 	tok, err := deps.Session.Token(context.Background())
 	if err != nil || tok != "env-token" {
 		t.Fatalf("Token = %q, %v", tok, err)
+	}
+}
+
+func TestStartServeDeps_LogsStoreWarning(t *testing.T) {
+	isolate(t)
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	w := "PRESSWRENCH_CREDENTIAL_STORE=file overrides the keyring store used at sign-in; sessions saved there aren't visible."
+	store := infoStore{tempStore(t), creds.Info{Source: creds.SourceFile, Description: "file x", Warning: w}}
+	deps, done := startServeDeps(context.Background(), &config.Config{}, func() (creds.Store, error) { return store, nil })
+	defer deps.SSHPool.Close()
+	defer deps.Session.Close()
+	waitDone(t, done)
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "sessions saved there aren't visible") {
+		t.Errorf("log = %q, want the store warning at WARN", out)
 	}
 }

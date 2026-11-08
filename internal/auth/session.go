@@ -97,19 +97,29 @@ func (s *Session) State() (creds.Source, error) {
 		return creds.SourceEnv, nil
 	}
 	if s.store == nil {
-		return creds.SourceNotFound, &LoginRequiredError{Account: s.account}
+		return creds.SourceNotFound, s.loginRequired(false)
 	}
 	r, err := s.store.Load(s.account)
 	if err != nil {
 		if creds.KindOf(err) == creds.KindNotFound {
-			err = &LoginRequiredError{Account: s.account}
+			err = s.loginRequired(false)
 		}
 		return creds.SourceNotFound, err
 	}
 	if !r.SignedIn() {
-		return creds.SourceNotFound, &LoginRequiredError{Account: s.account}
+		return creds.SourceNotFound, s.loginRequired(false)
 	}
 	return s.store.Info().Source, nil
+}
+
+// loginRequired is the error for "no usable session", carrying the store's
+// warning (an override hiding the sign-in store) so it reaches the user.
+func (s *Session) loginRequired(expired bool) error {
+	e := &LoginRequiredError{Account: s.account, Expired: expired}
+	if s.store != nil {
+		e.StoreWarning = s.store.Info().Warning
+	}
+	return e
 }
 
 // Identity returns the stored "Name <email>" of the signed-in user, or ""
@@ -133,7 +143,7 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 		return s.envToken, nil
 	}
 	if s.store == nil {
-		return "", &LoginRequiredError{Account: s.account}
+		return "", s.loginRequired(false)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -214,7 +224,7 @@ func (s *Session) refreshLocked(ctx context.Context, now time.Time, lock *lockfi
 		return s.access, false, nil
 	}
 	if stored.ClientID == "" || stored.RefreshToken == "" {
-		return "", false, &LoginRequiredError{Account: s.account}
+		return "", false, s.loginRequired(false)
 	}
 	clientID, refresh := stored.ClientID, stored.RefreshToken
 	tr, err := Refresh(ctx, s.http, s.authURL, clientID, refresh)
@@ -234,7 +244,7 @@ func (s *Session) refreshLocked(ctx context.Context, now time.Time, lock *lockfi
 			tr, err = Refresh(ctx, s.http, s.authURL, clientID, again.RefreshToken)
 		}
 		if errors.As(err, &oe) && oe.Code == "invalid_grant" {
-			return "", false, &LoginRequiredError{Account: s.account, Expired: true}
+			return "", false, s.loginRequired(true)
 		}
 	}
 	if err != nil {
@@ -325,7 +335,7 @@ func (s *Session) refreshPendingLocked(ctx context.Context, now time.Time) (stri
 			"account", AccountLabel(s.account))
 		s.dropPendingLocked()
 		s.access, s.expiry = "", time.Time{}
-		return "", &LoginRequiredError{Account: s.account, Expired: true}
+		return "", s.loginRequired(true)
 	}
 	if err != nil {
 		return "", err // still pending, lock still held

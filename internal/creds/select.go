@@ -48,6 +48,16 @@ func Open() (Store, error) {
 	})
 }
 
+// Override returns the backend forced by PRESSWRENCH_CREDENTIAL_STORE
+// ("keyring" or "file"), or "" when it is unset or invalid.
+func Override() string {
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(EnvCredentialStore))); v {
+	case "keyring", "file":
+		return v
+	}
+	return ""
+}
+
 func readMarker(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {

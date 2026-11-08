@@ -1338,3 +1338,29 @@ func TestSession_PartialSaveThenPendingRefreshStillSaves(t *testing.T) {
 		t.Errorf("stored = %q/%q, want refresh-3/%q (a valid session was discarded)", r.RefreshToken, r.AccessToken, again)
 	}
 }
+
+// warnStore reports a store warning, like an override that hides the
+// sessions saved at sign-in.
+type warnStore struct {
+	creds.Store
+	warning string
+}
+
+func (w warnStore) Info() creds.Info {
+	i := w.Store.Info()
+	i.Warning = w.warning
+	return i
+}
+
+func TestSession_LoginRequiredCarriesStoreWarning(t *testing.T) {
+	t.Setenv(EnvAccessToken, "")
+	s := NewSession(warnStore{newStore(t), "override!"}, "dev", "http://unused")
+	_, err := s.Token(context.Background())
+	var lr *LoginRequiredError
+	if !errors.As(err, &lr) || lr.StoreWarning != "override!" {
+		t.Fatalf("Token err = %#v", err)
+	}
+	if _, err := s.State(); !errors.As(err, &lr) || lr.StoreWarning != "override!" {
+		t.Fatalf("State err = %#v", err)
+	}
+}
