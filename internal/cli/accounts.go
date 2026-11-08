@@ -101,12 +101,14 @@ func newAccountsRemove() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			authURL := ""
 			if cfg, err := loadConfigFor(account); err == nil {
-				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
+				authURL = cfg.AuthURL
 			}
-			_ = store.Delete(account)
 			u := ui.New(os.Stdout, os.Stdin)
-			u.Step("Signed out and removed the session", "account "+account)
+			if err := removeSession(u, store, account, authURL); err != nil {
+				return err
+			}
 			for _, p := range clients.All(account) {
 				changed, err := p.Unpatch()
 				if err != nil {
@@ -125,6 +127,18 @@ func newAccountsRemove() *cobra.Command {
 	cmd.Flags().StringVar(&account, "account", "", "named account to remove (required; cannot be empty)")
 	cmd.Flags().BoolVar(&yes, "yes", false, "confirm the destructive operation")
 	return cmd
+}
+
+// removeSession revokes (best effort) and deletes an account's stored
+// session, printing the outcome. A failed delete is shown with its fix and
+// returned as a reported error, so the command exits non-zero.
+func removeSession(u *ui.UI, store creds.Store, account, authURL string) error {
+	if err := auth.RemoveAccount(context.Background(), store, account, authURL); err != nil {
+		u.Fail("Could not remove the stored session", auth.Explain(err))
+		return ui.Reported(err)
+	}
+	u.Step("Signed out and removed the stored session", "account "+auth.AccountLabel(account))
+	return nil
 }
 
 // listAccounts returns one row per discovered account, unioning the

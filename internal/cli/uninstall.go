@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"os"
 
@@ -96,6 +95,7 @@ func NewUninstall() *cobra.Command {
 				}
 			}
 
+			var credErr error
 			if removeCreds {
 				store, err := creds.Open()
 				if err != nil {
@@ -105,9 +105,7 @@ func NewUninstall() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				_ = auth.SignOut(context.Background(), store, account, cfg.AuthURL)
-				_ = store.Delete(account)
-				u.Step("Signed out and removed the stored session", "account "+auth.AccountLabel(account))
+				credErr = removeSession(u, store, account, cfg.AuthURL)
 			}
 
 			if removeKey {
@@ -125,6 +123,9 @@ func NewUninstall() *cobra.Command {
 				}
 				ar := u.Arrow()
 				u.Warn(fmt.Sprintf("Also delete the public key from MyPressable %s Profile %s Settings %s SSH Keys", ar, ar, ar), "")
+			}
+			if credErr != nil {
+				return credErr
 			}
 			fmt.Println()
 			u.Step("Uninstall complete", "")

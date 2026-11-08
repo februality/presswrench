@@ -2,62 +2,37 @@ package auth
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/februality/presswrench/internal/creds"
+	"github.com/februality/presswrench/internal/lockfile"
 )
 
-const (
-	lockStaleAfter = 60 * time.Second
-	lockWait       = 30 * time.Second
-	lockPoll       = 100 * time.Millisecond
-)
+// lockWait bounds how long an operation waits for another process holding
+// the account lock; tests shrink it.
+var lockWait = 30 * time.Second
 
-// lockDir is where refresh locks live; overridable in tests.
+// lockDir is where account locks live; overridable in tests.
 var lockDir = creds.ConfigDir
 
-// acquireRefreshLock takes a cross-process lock for refreshing one
-// account's session. It's an O_EXCL lockfile rather than flock so it works
-// the same on every OS; a lock older than lockStaleAfter is assumed to be
-// left by a crashed process and broken.
-func acquireRefreshLock(ctx context.Context, account string) (func(), error) {
+// lockAccount takes the cross-process lock that serializes every
+// read-modify-write of one account's session: refresh, login's two short
+// store steps, logout and remove. Pressable rotates refresh tokens, so two
+// processes must never spend the same one. The lock is heartbeated while
+// held (see lockfile), so a slow refresh is never mistaken for a crash.
+//
+// Take it before any store call in the critical section, never while a
+// store call is in flight: the store's own index/file locks nest inside it.
+// On timeout the error is a *lockfile.HeldError.
+func lockAccount(ctx context.Context, account string) (*lockfile.Lock, error) {
 	dir, err := lockDir()
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	name := "refresh.lock"
+	name := "session.lock"
 	if account != "" {
-		name = "refresh-" + account + ".lock"
+		name = "session-" + account + ".lock"
 	}
-	path := filepath.Join(dir, name)
-	deadline := time.Now().Add(lockWait)
-	for {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		if err == nil {
-			_ = f.Close()
-			return func() { _ = os.Remove(path) }, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("refresh lock: %w", err)
-		}
-		if st, serr := os.Stat(path); serr == nil && time.Since(st.ModTime()) > lockStaleAfter {
-			_ = os.Remove(path)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out waiting for another presswrench process to refresh the session (lock %s)", path)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(lockPoll):
-		}
-	}
+	return lockfile.Acquire(ctx, filepath.Join(dir, name), lockWait)
 }

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,6 +34,10 @@ type fakeAS struct {
 	rotate     bool              // issue a new refresh token on refresh
 	issued     int
 	refreshes  int
+
+	delay         time.Duration // sleep before answering /auth/token
+	registrations int
+	revokes       int
 }
 
 func newFakeAS(t *testing.T) (*fakeAS, *httptest.Server) {
@@ -43,7 +46,12 @@ func newFakeAS(t *testing.T) (*fakeAS, *httptest.Server) {
 	mux.HandleFunc("/auth/register", f.register)
 	mux.HandleFunc("/auth/authorize", f.authorize)
 	mux.HandleFunc("/auth/token", f.token)
-	mux.HandleFunc("/auth/revoke", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("/auth/revoke", func(w http.ResponseWriter, _ *http.Request) {
+		f.mu.Lock()
+		f.revokes++
+		f.mu.Unlock()
+		w.WriteHeader(200)
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return f, srv
@@ -60,6 +68,7 @@ func (f *fakeAS) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
+	f.registrations++
 	id := "client-" + strconv.Itoa(len(f.clients)+1)
 	f.clients[id] = true
 	f.mu.Unlock()
@@ -90,6 +99,10 @@ func (f *fakeAS) authorize(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeAS) token(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
+	f.mu.Lock()
+	delay := f.delay
+	f.mu.Unlock()
+	time.Sleep(delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fail := func(code string) {
@@ -378,39 +391,6 @@ func TestSignOut_KeepsClientRegistration(t *testing.T) {
 	}
 }
 
-func TestRefreshLock_SerializesAndBreaksStale(t *testing.T) {
-	dir := t.TempDir()
-	lockDir = func() (string, error) { return dir, nil }
-	unlock, err := acquireRefreshLock(context.Background(), "x")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel()
-	if _, err := acquireRefreshLock(ctx, "x"); err == nil {
-		t.Fatal("second acquire should block while held")
-	}
-	unlock()
-	unlock2, err := acquireRefreshLock(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("acquire after release: %v", err)
-	}
-	unlock2()
-
-	// A stale lock (crashed holder) is broken.
-	stale := filepath.Join(dir, "refresh-x.lock")
-	if err := os.WriteFile(stale, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-2 * lockStaleAfter)
-	_ = os.Chtimes(stale, old, old)
-	unlock3, err := acquireRefreshLock(context.Background(), "x")
-	if err != nil {
-		t.Fatalf("stale lock not broken: %v", err)
-	}
-	unlock3()
-}
-
 func TestCallback_IgnoresForeignState(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -467,9 +447,17 @@ func TestLogin_ReportsBrowserOpened(t *testing.T) {
 // every Load; saveErrs are consumed one per Save call (nil entry = succeed).
 type faultyStore struct {
 	creds.Store
-	loadErr  error
-	saveErrs []error
-	saves    int
+	loadErr   error
+	saveErrs  []error
+	saves     int
+	deleteErr error
+}
+
+func (f *faultyStore) Delete(account string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	return f.Store.Delete(account)
 }
 
 func (f *faultyStore) Load(account string) (creds.Record, error) {

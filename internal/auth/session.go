@@ -110,11 +110,11 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 	// Serialize refreshes across processes so two servers never spend the
 	// same refresh token (a rotating server would reject the second, or
 	// revoke the whole token family on reuse).
-	unlock, err := acquireRefreshLock(ctx, s.account)
+	lock, err := lockAccount(ctx, s.account)
 	if err != nil {
 		return "", err
 	}
-	defer unlock()
+	defer lock.Release()
 
 	// A sibling may have refreshed while we waited for the lock.
 	if tok, exp, ok := s.loadStoredAccess(); ok && tok != s.bad && now.Before(exp.Add(-refreshMargin)) {
@@ -182,17 +182,20 @@ func (s *Session) loadStoredAccess() (string, time.Time, bool) {
 // SaveTokens persists a token response in one write: it loads the record,
 // replaces the token fields (the refresh token only when Pressable issued a
 // new one) and the identity (when the response carries one), and saves it.
+// The caller holds the account lock.
 func SaveTokens(store creds.Store, account string, tr *TokenResponse, now time.Time) error {
-	return saveTokens(store, account, tr, now, false)
-}
-
-// saveTokens is SaveTokens; replace (a new login) also drops the previous
-// identity, so the session is replaced wholesale.
-func saveTokens(store creds.Store, account string, tr *TokenResponse, now time.Time, replace bool) error {
 	r, err := loadForUpdate(store, account)
 	if err != nil {
 		return err
 	}
+	applyTokens(&r, tr, now, false)
+	return store.Save(account, r)
+}
+
+// applyTokens copies a token response into r: the refresh token only when
+// Pressable issued a new one, the identity when the response carries one.
+// replace (a new login) drops the previous identity first.
+func applyTokens(r *creds.Record, tr *TokenResponse, now time.Time, replace bool) {
 	if tr.RefreshToken != "" {
 		r.RefreshToken = tr.RefreshToken
 	}
@@ -204,7 +207,6 @@ func saveTokens(store creds.Store, account string, tr *TokenResponse, now time.T
 	if id := tr.Identity(); id != "" {
 		r.Identity = id
 	}
-	return store.Save(account, r)
 }
 
 // loadForUpdate loads the record a write will modify. A missing, corrupt or
