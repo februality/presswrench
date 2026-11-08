@@ -58,16 +58,29 @@ func Override() string {
 	return ""
 }
 
-func readMarker(path string) string {
+// readMarker returns the backend remembered at sign-in, "" when there is
+// no marker. A marker that can't be read or holds anything else is an
+// error (KindUnavailable, Op "marker"): guessing could switch backends and
+// hide every stored session.
+func readMarker(path string) (string, error) {
 	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
 	if err != nil {
-		return ""
+		return "", markerError(path, fmt.Sprintf("can't be read (%v)", err), err)
 	}
-	switch v := strings.TrimSpace(string(b)); v {
+	switch v := strings.ToLower(strings.TrimSpace(string(b))); v {
 	case "keyring", "file":
-		return v
+		return v, nil
+	default:
+		return "", markerError(path, fmt.Sprintf("contains %q, not keyring or file", v), nil)
 	}
-	return ""
+}
+
+func markerError(path, what string, err error) error {
+	return &Error{Kind: KindUnavailable, Op: "marker", Err: err,
+		Detail: fmt.Sprintf("the credential-store marker %s %s; delete it (PressWrench then picks the store again) or set %s=keyring or file", path, what, EnvCredentialStore)}
 }
 
 func openWith(o selectOpts) (Store, error) {
@@ -75,7 +88,10 @@ func openWith(o selectOpts) (Store, error) {
 	if env != "" && env != "keyring" && env != "file" {
 		return nil, &Error{Kind: KindOther, Op: "open", Detail: EnvCredentialStore + " must be keyring or file"}
 	}
-	marker := readMarker(o.markerPath)
+	marker, merr := readMarker(o.markerPath)
+	if merr != nil && env == "" {
+		return nil, merr
+	}
 
 	want, reason := env, ""
 	switch {
@@ -132,8 +148,8 @@ func RememberBackend(s Store) error {
 	if err != nil {
 		return err
 	}
-	if readMarker(path) == val {
-		return nil
+	if cur, err := readMarker(path); err == nil && cur == val {
+		return nil // a damaged marker is replaced
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err

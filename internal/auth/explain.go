@@ -101,6 +101,9 @@ func Explain(err error) string {
 			}
 			return "The system keyring is locked. Unlock it, then retry."
 		case creds.KindDenied:
+			if ce.Backend == creds.SourceFile {
+				return "PressWrench can't read or write its credentials file (" + ce.Detail + "). Fix its permissions (it should be yours, mode 0600), then retry."
+			}
 			return "Access to PressWrench's keychain item was denied. Retry and choose Always Allow when macOS asks."
 		case creds.KindTimeout:
 			if runtime.GOOS == "darwin" {
@@ -108,10 +111,19 @@ func Explain(err error) string {
 			}
 			return "The system keyring is waiting for you to unlock or approve access for PressWrench. Approve it, then retry."
 		case creds.KindUnavailable:
+			if ce.Op == "marker" {
+				return "PressWrench can't tell which credential store holds your sessions: " + ce.Detail + ", then retry."
+			}
 			return "The system keyring isn't available (" + ce.Detail + "). Start it, or set PRESSWRENCH_CREDENTIAL_STORE=file and sign in again with `" + bareLoginCommand(ce.Account) + "`."
 		case creds.KindCorrupt:
+			if ce.Op == "index" {
+				return "PressWrench's list of signed-in accounts is damaged. Sign in again with `" + LoginCommand("") + "` (and `--account <name>` for other accounts) to rebuild it."
+			}
 			return "The stored PressWrench session for account " + label + " is damaged. Run " + cmd + " to sign in again."
 		case creds.KindNewerFormat:
+			if ce.Op == "index" {
+				return "PressWrench's list of signed-in accounts was saved by a newer PressWrench. Upgrade PressWrench."
+			}
 			return "The session for account " + label + " was saved by a newer PressWrench. Upgrade PressWrench, or sign in again with " + cmd + "."
 		case creds.KindTooLarge:
 			return "The PressWrench session for account " + label + " is too large for the system keyring (" + ce.Detail + "). Set PRESSWRENCH_CREDENTIAL_STORE=file and sign in again."

@@ -150,3 +150,70 @@ func TestOpenWith_KeyringTimeoutDoesNotFallBack(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenWith_Marker(t *testing.T) {
+	open := func(t *testing.T, env string, write func(path string)) (Store, error) {
+		t.Helper()
+		dir := t.TempDir()
+		marker := filepath.Join(dir, "store")
+		write(marker)
+		return openWith(selectOpts{
+			env: env, markerPath: marker, filePath: filepath.Join(dir, "credentials.json"),
+			lockDir: dir, openKeyring: fakeKeyring(true),
+		})
+	}
+	content := func(v string) func(string) {
+		return func(p string) {
+			if err := os.WriteFile(p, []byte(v), 0o600); err != nil {
+				panic(err)
+			}
+		}
+	}
+	unreadable := func(p string) { // a directory where the file should be
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			panic(err)
+		}
+	}
+
+	t.Run("case and whitespace", func(t *testing.T) {
+		s, err := open(t, "", content("  FILE \r\n"))
+		if err != nil || s.Info().Source != SourceFile {
+			t.Fatalf("store = %v, err = %v; want the file store", s, err)
+		}
+	})
+	for name, write := range map[string]func(string){"garbled": content("kyring\n"), "empty": content(""), "unreadable": unreadable} {
+		t.Run(name, func(t *testing.T) {
+			_, err := open(t, "", write)
+			var e *Error
+			if !errors.As(err, &e) || e.Kind != KindUnavailable || e.Op != "marker" {
+				t.Fatalf("err = %#v, want a KindUnavailable marker error", err)
+			}
+			if !strings.Contains(e.Detail, "store") || !strings.Contains(e.Detail, EnvCredentialStore) {
+				t.Errorf("Detail = %q, want the marker path and the fix", e.Detail)
+			}
+		})
+		t.Run(name+" with override", func(t *testing.T) {
+			s, err := open(t, "file", write)
+			if err != nil || s.Info().Source != SourceFile {
+				t.Fatalf("store = %v, err = %v; the override must still work", s, err)
+			}
+		})
+	}
+}
+
+func TestRememberBackend_ReplacesGarbledMarker(t *testing.T) {
+	dir := t.TempDir()
+	old := configDir
+	configDir = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { configDir = old })
+	marker := filepath.Join(dir, "store")
+	if err := os.WriteFile(marker, []byte("kyring\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RememberBackend(NewFileStore(filepath.Join(dir, "credentials.json"))); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "file\n" {
+		t.Fatalf("marker = %q, want file", b)
+	}
+}

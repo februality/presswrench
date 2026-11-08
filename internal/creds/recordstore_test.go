@@ -344,3 +344,21 @@ func TestFileStore_ModeAndRemovalWhenEmpty(t *testing.T) {
 		t.Errorf("file should be removed when empty, stat err = %v", err)
 	}
 }
+
+// A damaged index is not any account's record: its errors say "index".
+func TestAccounts_CorruptIndexIsAnIndexError(t *testing.T) {
+	raw, s := newFakeStore(t)
+	raw.items[indexKey] = []byte("{not json")
+	_, err := s.Accounts()
+	var e *Error
+	if !errors.As(err, &e) || e.Kind != KindCorrupt || e.Op != "index" || e.Account != "" {
+		t.Fatalf("err = %#v, want a KindCorrupt index error", err)
+	}
+	// The next Save rebuilds it.
+	if err := s.Save("acme", Record{RefreshToken: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.Accounts(); err != nil || len(got) != 1 || got[0] != "acme" {
+		t.Fatalf("Accounts = %q, %v", got, err)
+	}
+}

@@ -197,19 +197,19 @@ func (s *recordStore) checkSize(b []byte) error {
 }
 
 // readIndex returns the indexed storage names (nil when there's no index).
+// Its errors carry Op "index", so they never read as a record's.
 func (s *recordStore) readIndex() ([]string, error) {
 	b, err := s.raw.get(indexKey)
 	if KindOf(err) == KindNotFound {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
+	if err == nil {
+		var idx indexValue
+		if err = decodeVersioned(b, indexVersion, &idx); err == nil {
+			return idx.Accounts, nil
+		}
 	}
-	var idx indexValue
-	if err := decodeVersioned(b, indexVersion, &idx); err != nil {
-		return nil, err
-	}
-	return idx.Accounts, nil
+	return nil, s.fail("index", "", err)
 }
 
 // updateIndex applies change to the index under the cross-process index

@@ -3,6 +3,8 @@ package auth
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -82,6 +84,53 @@ func TestExplain_LoginRequiredCarriesStoreWarning(t *testing.T) {
 	w := "PRESSWRENCH_CREDENTIAL_STORE=file overrides the keyring store used at sign-in; sessions saved there aren't visible."
 	got := Explain(&LoginRequiredError{Account: "dev", StoreWarning: w})
 	if !strings.HasPrefix(got, "Not signed in to Pressable (account dev).") || !strings.HasSuffix(got, " "+w) {
+		t.Errorf("Explain = %q", got)
+	}
+}
+
+func TestExplain_StoreMarker(t *testing.T) {
+	got := Explain(&creds.Error{Kind: creds.KindUnavailable, Op: "marker", Detail: "the credential-store marker /x/store contains \"kyring\"; delete it or set PRESSWRENCH_CREDENTIAL_STORE=keyring or file"})
+	want := "PressWrench can't tell which credential store holds your sessions: the credential-store marker /x/store contains \"kyring\"; delete it or set PRESSWRENCH_CREDENTIAL_STORE=keyring or file, then retry."
+	if got != want {
+		t.Errorf("Explain = %q\nwant      %q", got, want)
+	}
+}
+
+func TestExplain_FileDeniedAndIndex(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{&creds.Error{Kind: creds.KindDenied, Backend: creds.SourceFile, Op: "load", Detail: "reading credentials file /x/credentials.json: permission denied"},
+			"PressWrench can't read or write its credentials file (reading credentials file /x/credentials.json: permission denied). Fix its permissions (it should be yours, mode 0600), then retry."},
+		{&creds.Error{Kind: creds.KindCorrupt, Op: "index"},
+			"PressWrench's list of signed-in accounts is damaged. Sign in again with `presswrench login` (and `--account <name>` for other accounts) to rebuild it."},
+		{&creds.Error{Kind: creds.KindNewerFormat, Op: "index"},
+			"PressWrench's list of signed-in accounts was saved by a newer PressWrench. Upgrade PressWrench."},
+	}
+	for _, c := range cases {
+		if got := Explain(c.err); got != c.want {
+			t.Errorf("Explain(%v)\n got %q\nwant %q", c.err, got, c.want)
+		}
+	}
+}
+
+// A credentials file we can't read surfaces as the file-permissions hint.
+func TestExplain_UnreadableCredentialsFile(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs POSIX permissions and a non-root user")
+	}
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	store := creds.NewFileStore(path)
+	if err := store.Save("acme", creds.Record{RefreshToken: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	_, err := store.Load("acme")
+	if got := Explain(err); !strings.HasPrefix(got, "PressWrench can't read or write its credentials file (") || !strings.Contains(got, path) {
 		t.Errorf("Explain = %q", got)
 	}
 }
