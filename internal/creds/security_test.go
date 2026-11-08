@@ -104,6 +104,27 @@ func TestSecurity_Timeout(t *testing.T) {
 	}
 }
 
+func TestSecurity_SignalDeathIsOther(t *testing.T) {
+	f := &fakeSec{exit: -1, err: errors.New("signal: killed")}
+	b := newSecurityBackend("presswrench", f.run)
+	_, err := b.get("session:x")
+	var e *Error
+	if !errors.As(err, &e) || e.Kind != KindOther || !strings.Contains(e.Detail, "killed by a signal") {
+		t.Fatalf("err = %#v", err)
+	}
+}
+
+func TestSecurity_TimeoutWinsOverSignal(t *testing.T) {
+	old := keychainTimeout
+	keychainTimeout = 30 * time.Millisecond
+	t.Cleanup(func() { keychainTimeout = old })
+	f := &fakeSec{block: true} // returns exit -1 once the deadline kills it
+	b := newSecurityBackend("presswrench", f.run)
+	if err := b.set("session:x", "L", []byte("x")); KindOf(err) != KindTimeout {
+		t.Fatalf("kind = %v (%v), want KindTimeout", KindOf(err), err)
+	}
+}
+
 func TestSecurity_DeleteMissingIsNil(t *testing.T) {
 	f := &fakeSec{exit: 44, err: errors.New("exit status 44")}
 	b := newSecurityBackend("presswrench", f.run)
@@ -134,5 +155,52 @@ func TestSecurity_SetQuotesAndRejectsNewlines(t *testing.T) {
 	}
 	if err := b.set("session:a\nb", "L", []byte("x")); err == nil {
 		t.Error("newline in key accepted")
+	}
+}
+
+// security -i splits lines at ~4096 bytes and runs the rest as a separate
+// command, so the size cap must keep the whole add line under the limit for
+// the longest account name.
+func TestSecurity_MaxValueKeepsLineUnderLimit(t *testing.T) {
+	f := &fakeSec{}
+	b := newSecurityBackend("presswrench", f.run)
+	maxV := b.maxValue()
+	if maxV < 2500 || maxV > 3000 {
+		t.Fatalf("maxValue = %d, want about 2900", maxV)
+	}
+	worst := strings.Repeat("a", maxAccountName)
+	if err := b.set(sessionKey(worst), itemLabel(worst), make([]byte, maxV)); err != nil {
+		t.Fatalf("set at maxValue: %v", err)
+	}
+	if n := len(f.calls[0].stdin); n > securityLineLimit {
+		t.Errorf("line at maxValue is %d bytes, limit %d", n, securityLineLimit)
+	}
+	if err := b.set(sessionKey(worst), itemLabel(worst), make([]byte, maxV+3)); KindOf(err) != KindTooLarge {
+		t.Errorf("set past maxValue: kind = %v (%v), want KindTooLarge", KindOf(err), err)
+	}
+}
+
+func TestSecurity_SetRefusesOverlongLine(t *testing.T) {
+	f := &fakeSec{}
+	b := newSecurityBackend("presswrench", f.run)
+	long := strings.Repeat("x", 600) // an account name past the usual limit
+	err := b.set(sessionKey(long), itemLabel(long), make([]byte, b.maxValue()))
+	if KindOf(err) != KindTooLarge {
+		t.Fatalf("kind = %v (%v), want KindTooLarge", KindOf(err), err)
+	}
+	if len(f.calls) != 0 {
+		t.Error("an overlong line was sent to security")
+	}
+}
+
+func TestSecurity_RecordStoreRefusesLargeRecord(t *testing.T) {
+	f := &fakeSec{}
+	s := newRecordStore(newSecurityBackend("presswrench", f.run), Info{Source: SourceKeyring}, t.TempDir())
+	err := s.Save("acme", Record{RefreshToken: "r", AccessToken: strings.Repeat("a", 3000)})
+	if KindOf(err) != KindTooLarge {
+		t.Fatalf("kind = %v (%v), want KindTooLarge", KindOf(err), err)
+	}
+	if len(f.calls) != 0 {
+		t.Error("an oversized record was sent to security")
 	}
 }

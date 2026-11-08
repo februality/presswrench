@@ -3,6 +3,7 @@
 package creds
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,38 @@ import (
 	"testing"
 	"time"
 )
+
+// A killed child whose own child still holds the output pipes must not keep
+// runCommand waiting: WaitDelay bounds it.
+func TestRunCommand_KillBoundedWhenPipesHeld(t *testing.T) {
+	old := waitDelay
+	waitDelay = 200 * time.Millisecond
+	t.Cleanup(func() { waitDelay = old })
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, _, err := runCommand(ctx, "/bin/sh", "", "-c", "sleep 3 & sleep 3")
+	if err == nil {
+		t.Fatal("no error from a killed command")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("runCommand took %v after the kill; pipes held it open", d)
+	}
+}
+
+func TestRunCommand_SignalDeathIsNegativeExit(t *testing.T) {
+	_, _, exit, err := runCommand(context.Background(), "/bin/sh", "", "-c", "kill -9 $$")
+	if err == nil || exit != -1 {
+		t.Fatalf("exit = %d, err = %v; want -1 and an error", exit, err)
+	}
+}
+
+func TestRunCommand_StdinAndExitCode(t *testing.T) {
+	out, _, exit, err := runCommand(context.Background(), "/bin/sh", "hello\n", "-c", "cat; exit 44")
+	if exit != 44 || err == nil || string(out) != "hello\n" {
+		t.Fatalf("out = %q, exit = %d, err = %v", out, exit, err)
+	}
+}
 
 // Touches the real login keychain under a throwaway service name, so it only
 // runs when asked: PRESSWRENCH_KEYCHAIN_TEST=1 go test ./internal/creds/
