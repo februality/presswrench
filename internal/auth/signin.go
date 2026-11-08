@@ -67,7 +67,7 @@ func isInvalidClient(err error) bool {
 // rejected is a client id Pressable just refused; it is replaced unless
 // another process already stored a different one meanwhile.
 func ensureClient(ctx context.Context, store creds.Store, account string, o LoginOptions, rejected string) (clientID string, fresh bool, err error) {
-	lock, err := lockAccount(ctx, account)
+	lock, err := lockAccountForUser(ctx, account)
 	if err != nil {
 		return "", false, err
 	}
@@ -103,7 +103,7 @@ func ensureClient(ctx context.Context, store creds.Store, account string, o Logi
 // browser) and replaces the session wholesale. The client id is set to the
 // one the tokens were issued to, since a refresh only works with that one.
 func storeLogin(ctx context.Context, store creds.Store, account, clientID string, tr *TokenResponse) error {
-	lock, err := lockAccount(ctx, account)
+	lock, err := lockAccountForUser(ctx, account)
 	if err != nil {
 		return err
 	}
@@ -122,7 +122,7 @@ func storeLogin(ctx context.Context, store creds.Store, account, clientID string
 // saving a record with only the OAuth client id so a later login reuses
 // the registration. It holds the account lock throughout.
 func SignOut(ctx context.Context, store creds.Store, account, authURL string) error {
-	lock, err := lockAccount(ctx, account)
+	lock, err := lockAccountForUser(ctx, account)
 	if err != nil {
 		return err
 	}
@@ -149,7 +149,7 @@ func SignOut(ctx context.Context, store creds.Store, account, authURL string) er
 // skipped when authURL is empty or the record can't be read; a failed
 // delete is returned. A missing record is not an error.
 func RemoveAccount(ctx context.Context, store creds.Store, account, authURL string) error {
-	lock, err := lockAccount(ctx, account)
+	lock, err := lockAccountForUser(ctx, account)
 	if err != nil {
 		return err
 	}

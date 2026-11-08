@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/februality/presswrench/internal/creds"
@@ -26,6 +27,19 @@ var lockDir = creds.ConfigDir
 // store call is in flight: the store's own index/file locks nest inside it.
 // On timeout the error is a *lockfile.HeldError.
 func lockAccount(ctx context.Context, account string) (*lockfile.Lock, error) {
+	return lockAccountWait(ctx, account, lockWait, nil)
+}
+
+// lockAccountForUser is lockAccount for what the user runs to fix an
+// account (login, logout, accounts remove): it takes over at once a lock
+// held by a session that couldn't be saved, which would otherwise hold it
+// until every `serve` exits. The former holder notices (Lock.Held) and
+// never overwrites what the user writes.
+func lockAccountForUser(ctx context.Context, account string) (*lockfile.Lock, error) {
+	return lockAccountWait(ctx, account, lockWait, isUnsavedReason)
+}
+
+func lockAccountWait(ctx context.Context, account string, wait time.Duration, takeOver func(string) bool) (*lockfile.Lock, error) {
 	dir, err := lockDir()
 	if err != nil {
 		return nil, err
@@ -34,5 +48,12 @@ func lockAccount(ctx context.Context, account string) (*lockfile.Lock, error) {
 	if account != "" {
 		name = "session-" + account + ".lock"
 	}
-	return lockfile.Acquire(ctx, filepath.Join(dir, name), lockWait)
+	return lockfile.AcquireTakingOver(ctx, filepath.Join(dir, name), wait, takeOver)
 }
+
+// unsavedPrefix starts the lock reason of a process holding a refreshed
+// session it couldn't save; lockAccountForUser takes such locks over.
+// Explain strips it.
+const unsavedPrefix = "unsaved-session: "
+
+func isUnsavedReason(reason string) bool { return strings.HasPrefix(reason, unsavedPrefix) }

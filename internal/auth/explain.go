@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"runtime"
+	"strings"
 
 	"github.com/februality/presswrench/internal/creds"
 	"github.com/februality/presswrench/internal/lockfile"
@@ -60,7 +61,7 @@ func Explain(err error) string {
 	var held *lockfile.HeldError
 	if errors.As(err, &held) {
 		if held.Reason != "" {
-			return "Another PressWrench process holds a newer session it couldn't save: " + held.Reason
+			return "Another PressWrench process holds a newer session it couldn't save: " + strings.TrimPrefix(held.Reason, unsavedPrefix)
 		}
 		return "Another PressWrench process is using the Pressable session. Retry in a moment."
 	}

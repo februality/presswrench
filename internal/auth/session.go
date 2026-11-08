@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,14 +45,26 @@ type Session struct {
 	bad      string // token the gateway rejected; never hand it out again
 
 	// A refreshed session that couldn't be saved (see persist). While
-	// pending != nil this process holds the account lock in held, and
-	// spent is the refresh token it exchanged (what the store still holds).
-	pending *creds.Record
-	spent   string
-	held    *lockfile.Lock
-	retry   *time.Timer // background save retry
-	closed  bool
+	// pending != nil this process holds the account lock in held (unless a
+	// user command took it over; see flushOnce), and spent is the refresh
+	// token it exchanged (what the store still holds).
+	pending   *creds.Record
+	spent     string
+	held      *lockfile.Lock
+	reason    string      // held's lock reason
+	retry     *time.Timer // background save retry
+	lastFlush time.Time   // last save attempt of pending, by s.now
+	flushing  bool        // a background flush is running without s.mu
+	idle      *sync.Cond  // on s.mu; broadcast when flushing ends
+	closed    bool
 }
+
+// errSessionClosed is returned by Token after Close.
+var errSessionClosed = errors.New("PressWrench is shutting down. Retry once your MCP client has restarted it.")
+
+// relockWait bounds how long a session whose lock a user command took over
+// waits to take it back before discarding its unsaved tokens.
+var relockWait = 2 * time.Second
 
 // saveBackoff is the wait before each retry of a save after a refresh
 // (len+1 attempts in all); tests zero it.
@@ -64,7 +77,7 @@ var pendingRetry = 30 * time.Second
 // NewSession binds a session to an account. store may be nil when
 // PRESSWRENCH_ACCESS_TOKEN is set.
 func NewSession(store creds.Store, account, authURL string) *Session {
-	return &Session{
+	s := &Session{
 		store:    store,
 		account:  account,
 		authURL:  authURL,
@@ -72,6 +85,8 @@ func NewSession(store creds.Store, account, authURL string) *Session {
 		now:      time.Now,
 		envToken: os.Getenv(EnvAccessToken),
 	}
+	s.idle = sync.NewCond(&s.mu)
+	return s
 }
 
 // Source reports where tokens come from.
@@ -107,8 +122,9 @@ func (s *Session) Identity() string {
 
 // Token returns a valid access token, refreshing if necessary.
 //
-// While a rotated session is unsaved (see persist), Token first retries the
-// save, serves the in-memory access token, and refreshes with the in-memory
+// While a rotated session is unsaved (see persist), Token serves the
+// in-memory access token, retries the save at most once per pendingRetry
+// (the background timer covers the rest), and refreshes with the in-memory
 // refresh token under the account lock it still holds.
 func (s *Session) Token(ctx context.Context) (string, error) {
 	if s.envToken != "" {
@@ -119,16 +135,36 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if s.pending != nil {
-		s.flushLocked()
+	if s.closed {
+		return "", errSessionClosed
 	}
+
 	now := s.now()
-	if s.access != "" && s.access != s.bad && now.Before(s.expiry.Add(-refreshMargin)) {
+	if s.pending != nil && !s.flushing && now.Sub(s.lastFlush) >= pendingRetry {
+		s.flushLocked(ctx)
+	}
+	if s.validLocked(now) {
 		return s.access, nil
 	}
 	if s.pending != nil {
-		return s.refreshPendingLocked(ctx, now)
+		for s.flushing { // never refresh or save alongside a background save
+			s.idle.Wait()
+		}
+		if s.closed {
+			return "", errSessionClosed
+		}
+		if s.pending != nil && !s.held.Held() {
+			s.flushLocked(ctx) // a user command took the lock: settle first
+		}
+		if s.pending != nil {
+			if tok, err := s.refreshPendingLocked(ctx, now); err != nil || tok != "" {
+				return tok, err
+			}
+			// Superseded while refreshing: fall through to the stored session.
+		}
+		if s.validLocked(now) {
+			return s.access, nil
+		}
 	}
 
 	// Another process may have refreshed already.
@@ -151,6 +187,10 @@ func (s *Session) Token(ctx context.Context) (string, error) {
 		lock.Release()
 	}
 	return tok, err
+}
+
+func (s *Session) validLocked(now time.Time) bool {
+	return s.access != "" && s.access != s.bad && now.Before(s.expiry.Add(-refreshMargin))
 }
 
 // refreshLocked refreshes from the stored refresh token. The caller holds
@@ -194,38 +234,15 @@ func (s *Session) refreshLocked(ctx context.Context, now time.Time, lock *lockfi
 	return s.access, keep, nil
 }
 
-// refreshPendingLocked refreshes an unsaved session with its in-memory
-// refresh token; the store's one is already spent. The account lock is
-// still held (s.held) from the refresh that produced it.
-func (s *Session) refreshPendingLocked(ctx context.Context, now time.Time) (string, error) {
-	p := *s.pending
-	tr, err := Refresh(ctx, s.http, s.authURL, p.ClientID, p.RefreshToken)
-	var oe *OAuthError
-	if errors.As(err, &oe) && oe.Code == "invalid_grant" {
-		// Pressable revoked the session we couldn't save; nothing is left
-		// to protect, so let others at the store (and its sign-in prompt).
-		slog.Error("Pressable rejected the unsaved session's refresh token; discarding it",
-			"account", AccountLabel(s.account))
-		s.dropPendingLocked()
-		return "", &LoginRequiredError{Account: s.account, Expired: true}
-	}
-	if err != nil {
-		return "", err
-	}
-	s.persist(ctx, p, tr, now, s.held)
-	return s.access, nil
-}
-
-// persist applies a token response to base (the record the refresh started
-// from), adopts the new tokens in memory, and saves them, retrying with
-// saveBackoff unless the error is permanent. lock is the held account lock.
+// persist applies a token response to base (the stored record the refresh
+// started from), adopts the new tokens in memory, and saves them, retrying
+// with saveBackoff. lock is the account lock, just taken.
 //
 // A failed save leaves this process the only holder of a rotated session:
-// the record is kept in s.pending, the lock in s.held (with a reason for
-// waiters) so no sibling spends the stale stored refresh token, and the save
-// is retried on later Token calls and every pendingRetry. It reports whether
-// it kept the lock; when it didn't, the caller releases it (or, for a
-// pending session, it was released here).
+// the record is kept in s.pending and the lock in s.held, with a reason for
+// waiters, so no sibling spends the stale stored refresh token. The save is
+// retried by Token and every pendingRetry. It reports whether it kept the
+// lock; when it didn't, the caller releases it.
 func (s *Session) persist(ctx context.Context, base creds.Record, tr *TokenResponse, now time.Time, lock *lockfile.Lock) (keep bool) {
 	r := base
 	applyTokens(&r, tr, now, false)
@@ -235,36 +252,36 @@ func (s *Session) persist(ctx context.Context, base creds.Record, tr *TokenRespo
 
 	err := s.saveWithRetry(ctx, r)
 	if err == nil {
-		if s.pending != nil {
-			s.dropPendingLocked()
-		}
 		return false
 	}
 	slog.Error("Could not save the refreshed Pressable session; keeping it in memory and holding the account lock until it saves",
 		"account", AccountLabel(s.account), "error", Explain(err))
-	if s.closed {
-		// Token after Close: nobody will retry, so don't strand the lock.
-		// (Close dropped any pending session, so the caller owns lock.)
-		return false
-	}
-	if s.pending == nil {
-		s.spent = base.RefreshToken // still what the store holds
-		s.held = lock
-	}
-	s.pending = &r
-	if serr := s.held.SetReason(fmt.Sprintf("account %s: %s", AccountLabel(s.account), Explain(err))); serr != nil {
+	s.pending, s.spent, s.held = &r, base.RefreshToken, lock
+	s.lastFlush = now
+	s.reason = fmt.Sprintf("%saccount %s: %s Sign in again with `%s` to replace it.",
+		unsavedPrefix, AccountLabel(s.account), sentence(Explain(err)), LoginCommand(s.account))
+	if serr := s.held.SetReason(s.reason); serr != nil {
 		slog.Debug("could not annotate the account lock", "error", serr)
 	}
 	s.scheduleRetryLocked()
 	return true
 }
 
-// saveWithRetry saves r, retrying after each saveBackoff delay unless the
-// error is permanent or ctx ends.
+// sentence ends msg with a full stop if it has no final punctuation.
+func sentence(msg string) string {
+	if msg == "" || strings.ContainsAny(msg[len(msg)-1:], ".!?") {
+		return msg
+	}
+	return msg + "."
+}
+
+// saveWithRetry saves r, retrying after each saveBackoff delay. It stops
+// early on permanent errors, and on Locked/Timeout: those already waited
+// (up to the keychain timeout) and a retry would only stall the server.
 func (s *Session) saveWithRetry(ctx context.Context, r creds.Record) error {
 	err := s.store.Save(s.account, r)
 	for _, d := range saveBackoff {
-		if err == nil || creds.Permanent(err) {
+		if k := creds.KindOf(err); err == nil || creds.Permanent(err) || k == creds.KindTimeout || k == creds.KindLocked {
 			break
 		}
 		t := time.NewTimer(d)
@@ -279,39 +296,134 @@ func (s *Session) saveWithRetry(ctx context.Context, r creds.Record) error {
 	return err
 }
 
-// flushLocked tries once to save the pending session. It first re-reads the
-// store: if the stored refresh token is no longer the one this process
-// spent, someone (a login) wrote a newer session, so the pending one is
-// discarded rather than overwriting it. Either way a settled session
-// releases the lock. The caller holds s.mu and s.pending != nil.
-func (s *Session) flushLocked() {
-	stored, err := s.store.Load(s.account)
-	switch kind := creds.KindOf(err); {
-	case err == nil && stored.RefreshToken == s.spent, kind == creds.KindCorrupt:
-		// Still ours (a damaged record is no one's): save over it.
-	case err == nil, kind == creds.KindNotFound, kind == creds.KindNewerFormat:
-		slog.Warn("The stored Pressable session changed while ours was unsaved; discarding ours",
+// refreshPendingLocked refreshes an unsaved session with its in-memory
+// refresh token (the store's one is already spent) under the lock still in
+// s.held, then tries to save the result like any flush. It returns "" with
+// no error when that flush found a newer stored session.
+func (s *Session) refreshPendingLocked(ctx context.Context, now time.Time) (string, error) {
+	p := *s.pending
+	tr, err := Refresh(ctx, s.http, s.authURL, p.ClientID, p.RefreshToken)
+	var oe *OAuthError
+	if errors.As(err, &oe) && oe.Code == "invalid_grant" {
+		// Pressable revoked the session we couldn't save; nothing is left
+		// to protect, so let others at the store (and its sign-in prompt).
+		slog.Error("Pressable rejected the unsaved session's refresh token; discarding it",
 			"account", AccountLabel(s.account))
 		s.dropPendingLocked()
 		s.access, s.expiry = "", time.Time{}
-		return
+		return "", &LoginRequiredError{Account: s.account, Expired: true}
+	}
+	if err != nil {
+		return "", err // still pending, lock still held
+	}
+	applyTokens(&p, tr, now, false)
+	s.pending = &p
+	s.access = tr.AccessToken
+	s.expiry = now.Add(time.Duration(tr.ExpiresIn) * time.Second)
+	s.bad = ""
+	s.flushLocked(ctx)
+	return s.access, nil
+}
+
+// flushResult is the outcome of one attempt to save a pending session.
+type flushResult int
+
+const (
+	flushPending    flushResult = iota // still unsaved; keep retrying
+	flushSaved                         // the store holds it
+	flushSuperseded                    // the store holds a newer session
+	flushLost                          // the lock was taken over and not regained
+)
+
+// flushOnce tries once to save p. It touches the store and the lock but no
+// Session state, so the background retry can run it without s.mu.
+//
+// If a user command (login, logout, remove) took the lock over, it takes
+// the lock back (relockWait) or gives up. It then re-reads the store: the
+// store already holding p counts as saved (a save that wrote the record but
+// then failed); a refresh token other than spent means someone wrote a
+// newer session, which is never overwritten; a damaged record is no one's
+// and is overwritten. It returns the lock now held for p.
+func (s *Session) flushOnce(ctx context.Context, p *creds.Record, spent string, held *lockfile.Lock, reason string) (flushResult, *lockfile.Lock) {
+	if !held.Held() {
+		held.Release() // stops its heartbeat; never touches the new holder's file
+		l, err := lockAccountWait(ctx, s.account, relockWait, nil)
+		if err != nil {
+			return flushLost, nil
+		}
+		held = l
+		if serr := held.SetReason(reason); serr != nil {
+			slog.Debug("could not annotate the account lock", "error", serr)
+		}
+	}
+	stored, err := s.store.Load(s.account)
+	kind := creds.KindOf(err)
+	switch {
+	case err == nil && stored.RefreshToken == p.RefreshToken:
+		return flushSaved, held
+	case err == nil && stored.RefreshToken == spent, err != nil && kind == creds.KindCorrupt:
+		// Still ours: save over it.
+	case err == nil, kind == creds.KindNotFound, kind == creds.KindNewerFormat:
+		return flushSuperseded, held
 	default:
 		slog.Debug("still can't read the session store", "account", AccountLabel(s.account), "error", Explain(err))
-		return
+		return flushPending, held
 	}
-	if err := s.store.Save(s.account, *s.pending); err != nil {
+	if err := s.store.Save(s.account, *p); err != nil {
 		slog.Debug("still can't save the refreshed session", "account", AccountLabel(s.account), "error", Explain(err))
+		return flushPending, held
+	}
+	return flushSaved, held
+}
+
+// flushLocked runs flushOnce under s.mu and applies its outcome.
+func (s *Session) flushLocked(ctx context.Context) {
+	s.lastFlush = s.now()
+	p := s.pending
+	res, lock := s.flushOnce(ctx, p, s.spent, s.held, s.reason)
+	s.settleFlushLocked(p, res, lock)
+}
+
+// settleFlushLocked applies a flush of p that returned res holding lock.
+func (s *Session) settleFlushLocked(p *creds.Record, res flushResult, lock *lockfile.Lock) {
+	if s.pending != p { // settled while the flush ran
+		if lock != nil && lock != s.held {
+			lock.Release()
+		}
 		return
 	}
-	slog.Info("Saved the refreshed Pressable session", "account", AccountLabel(s.account))
-	s.dropPendingLocked()
+	if lock != s.held {
+		s.held.Release() // lost; Release leaves the new holder's file alone
+		s.held = lock
+	}
+	if s.closed { // Close left the release to us
+		s.dropPendingLocked()
+		return
+	}
+	switch res {
+	case flushSaved:
+		slog.Info("Saved the refreshed Pressable session", "account", AccountLabel(s.account))
+		s.dropPendingLocked()
+	case flushSuperseded:
+		slog.Warn("A newer Pressable session was stored while ours was unsaved; discarding ours",
+			"account", AccountLabel(s.account))
+		s.dropPendingLocked()
+		s.access, s.expiry = "", time.Time{}
+	case flushLost:
+		// A sign-in, sign-out or remove holds the account; it decides
+		// what's stored. The access token stays usable until it expires;
+		// the next refresh goes through the store.
+		slog.Warn("Another PressWrench command took over the account while our refreshed session was unsaved; discarding it",
+			"account", AccountLabel(s.account))
+		s.dropPendingLocked()
+	}
 }
 
 // dropPendingLocked forgets the pending record, stops the retry timer and
 // releases the account lock. In-memory access tokens are left to the
 // caller.
 func (s *Session) dropPendingLocked() {
-	s.pending, s.spent = nil, ""
+	s.pending, s.spent, s.reason = nil, "", ""
 	if s.retry != nil {
 		s.retry.Stop()
 		s.retry = nil
@@ -328,31 +440,58 @@ func (s *Session) scheduleRetryLocked() {
 		return
 	}
 	var t *time.Timer
-	t = time.AfterFunc(pendingRetry, func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if s.retry != t { // stopped or replaced after this tick fired
-			return
-		}
-		s.flushLocked()
-		if s.pending != nil && s.retry == t {
-			t.Reset(pendingRetry)
-		}
-	})
+	// The tick reads t only under s.mu, which we hold until t is set.
+	t = time.AfterFunc(pendingRetry, func() { s.retryTick(func() *time.Timer { return t }) })
 	s.retry = t
 }
 
+// retryTick is one background save attempt. The keychain calls run without
+// s.mu so a hung keychain doesn't block Token serving the in-memory token;
+// Token waits (s.idle) before it refreshes or saves itself.
+func (s *Session) retryTick(timer func() *time.Timer) {
+	s.mu.Lock()
+	t := timer()
+	if s.retry != t || s.pending == nil || s.closed || s.flushing {
+		s.mu.Unlock()
+		return
+	}
+	p, spent, held, reason := s.pending, s.spent, s.held, s.reason
+	s.flushing = true
+	s.lastFlush = s.now()
+	s.mu.Unlock()
+
+	res, lock := s.flushOnce(context.Background(), p, spent, held, reason)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.flushing = false
+	s.idle.Broadcast()
+	s.settleFlushLocked(p, res, lock)
+	if s.pending != nil && s.retry == t {
+		t.Reset(pendingRetry)
+	}
+}
+
 // Close stops the background save retry and releases the account lock a
-// pending session holds; unsaved tokens are lost. Idempotent, safe when
-// nothing is pending or Token was never called; it waits for an in-flight
-// Token call.
+// pending session holds; unsaved tokens are lost. If a background save is
+// in flight, the lock is released when it ends (never while a write may
+// still land); if the process exits first, the lock goes stale. Idempotent,
+// safe when nothing is pending or Token was never called; it waits for an
+// in-flight Token call. Token fails after Close.
 func (s *Session) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.closed = true
-	if s.pending != nil {
+	if s.pending != nil && !s.closed {
 		slog.Error("Exiting with a refreshed Pressable session that was never saved; you may need to sign in again",
 			"account", AccountLabel(s.account), "command", LoginCommand(s.account))
+	}
+	s.closed = true
+	if s.flushing {
+		if s.retry != nil {
+			s.retry.Stop()
+			s.retry = nil
+		}
+		return
 	}
 	s.dropPendingLocked()
 }
