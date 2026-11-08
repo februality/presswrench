@@ -37,7 +37,7 @@ func TestExplain(t *testing.T) {
 		{"newer", &creds.Error{Kind: creds.KindNewerFormat, Account: "acme"}, "The session for account acme was saved by a newer PressWrench. Upgrade PressWrench, or sign in again with `presswrench login --account acme`."},
 		{"toolarge", &creds.Error{Kind: creds.KindTooLarge, Account: "acme", Detail: "3000 > 2560 bytes"}, "The PressWrench session for account acme is too large for the system keyring (3000 > 2560 bytes). Set PRESSWRENCH_CREDENTIAL_STORE=file and sign in again."},
 		{"held reason", &lockfile.HeldError{Path: "p", Reason: "keychain locked"}, "Another PressWrench process holds a newer session it couldn't save: keychain locked"},
-		{"held wrapped", &creds.Error{Kind: creds.KindOther, Err: &lockfile.HeldError{Path: "p"}}, "Another PressWrench process is refreshing the Pressable session. Retry in a moment."},
+		{"held wrapped", &creds.Error{Kind: creds.KindOther, Err: &lockfile.HeldError{Path: "p"}}, "Another PressWrench process is using the Pressable session. Retry in a moment."},
 		{"other", errors.New("boom"), "boom"},
 	}
 	for _, c := range cases {

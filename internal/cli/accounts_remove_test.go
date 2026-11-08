@@ -50,3 +50,44 @@ func TestRemoveSession_DeletesRecord(t *testing.T) {
 		t.Errorf("output = %q", out.String())
 	}
 }
+
+type failingLoad struct {
+	creds.Store
+	err error
+}
+
+func (f failingLoad) Load(string) (creds.Record, error) { return creds.Record{}, f.err }
+
+func TestSignOut_ReportsFailure(t *testing.T) {
+	withTempHome(t)
+	store := failingLoad{
+		Store: creds.NewFileStore(filepath.Join(t.TempDir(), "credentials.json")),
+		err:   &creds.Error{Kind: creds.KindLocked, Account: "acme", Op: "load"},
+	}
+	var out bytes.Buffer
+	err := signOut(ui.NewTest(&out, false, false, 100), store, "acme", "")
+	if err == nil || !ui.IsReported(err) || ui.ExitCode(err) == 0 {
+		t.Fatalf("err = %v, want a reported non-zero error", err)
+	}
+	if s := out.String(); !strings.Contains(s, "Could not sign out") || !strings.Contains(s, "locked") {
+		t.Errorf("output = %q, want a failure line explaining the lock", s)
+	}
+}
+
+func TestSignOut_SignedOut(t *testing.T) {
+	withTempHome(t)
+	store := creds.NewFileStore(filepath.Join(t.TempDir(), "credentials.json"))
+	if err := store.Save("acme", creds.Record{ClientID: "c", RefreshToken: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := signOut(ui.NewTest(&out, false, false, 100), store, "acme", ""); err != nil {
+		t.Fatalf("signOut: %v", err)
+	}
+	if r, _ := store.Load("acme"); r.RefreshToken != "" || r.ClientID != "c" {
+		t.Errorf("record after sign-out = %+v", r)
+	}
+	if !strings.Contains(out.String(), "Signed out") {
+		t.Errorf("output = %q", out.String())
+	}
+}

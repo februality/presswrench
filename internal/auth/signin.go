@@ -89,8 +89,10 @@ func ensureClient(ctx context.Context, store creds.Store, account string, o Logi
 	if err != nil {
 		return "", false, err
 	}
-	r.ClientID = clientID
-	if err := store.Save(account, r); err != nil {
+	// Any tokens in the old record belong to no client or to the rejected
+	// one, so they're useless: keep only the new client id. A login
+	// interrupted after this leaves a client-only, unlisted record.
+	if err := store.Save(account, creds.Record{ClientID: clientID}); err != nil {
 		return "", false, err
 	}
 	return clientID, true, nil

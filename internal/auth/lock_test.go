@@ -108,8 +108,11 @@ func TestSignIn_CorruptRecordReRegisters(t *testing.T) {
 	if r, err := fs.Load("acme"); err != nil || !r.SignedIn() {
 		t.Fatalf("record after login = %+v, %v", r, err)
 	}
-	if f.registrations != 1 {
-		t.Errorf("registrations = %d, want 1", f.registrations)
+	f.mu.Lock()
+	regs := f.registrations
+	f.mu.Unlock()
+	if regs != 1 {
+		t.Errorf("registrations = %d, want 1", regs)
 	}
 }
 
@@ -144,8 +147,11 @@ func TestSession_SlowRefreshNotDoubleSpent(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.refreshes != 1 {
-		t.Errorf("refreshes = %d, want 1 (the refresh token was spent twice)", f.refreshes)
+	// Count attempts, not successes: a second spend is rejected and then
+	// masked by Token's invalid_grant fallback, so both calls would still
+	// succeed with refreshes == 1.
+	if f.refreshAttempts != 1 || f.refreshRejected != 0 {
+		t.Errorf("refresh attempts = %d, rejected = %d; want 1, 0 (the refresh token was spent twice)", f.refreshAttempts, f.refreshRejected)
 	}
 }
 
@@ -208,8 +214,11 @@ func TestSignOut_TakesAccountLock(t *testing.T) {
 	if err := RemoveAccount(context.Background(), store, "", srv.URL); !errors.As(err, &held) {
 		t.Fatalf("RemoveAccount while locked = %v, want *lockfile.HeldError", err)
 	}
-	if r, _ := store.Load(""); !r.SignedIn() || f.revokes != 0 {
-		t.Errorf("session touched without the lock: %+v, revokes=%d", r, f.revokes)
+	f.mu.Lock()
+	revokes := f.revokes
+	f.mu.Unlock()
+	if r, _ := store.Load(""); !r.SignedIn() || revokes != 0 {
+		t.Errorf("session touched without the lock: %+v, revokes=%d", r, revokes)
 	}
 }
 
@@ -249,5 +258,39 @@ func TestRemoveAccount_MissingIsNotAnError(t *testing.T) {
 	store := newStore(t)
 	if err := RemoveAccount(context.Background(), store, "ghost", ""); err != nil {
 		t.Fatalf("RemoveAccount of a missing account: %v", err)
+	}
+}
+
+func TestSignIn_ReplacedClientDropsOldTokens(t *testing.T) {
+	_, srv := newFakeAS(t)
+	store := newStore(t)
+	if err := store.Save("acme", creds.Record{ClientID: "deleted-client", RefreshToken: "old-refresh", AccessToken: "old-access", Identity: "Old <old@example.com>"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	// The first attempt hits the deleted client; the user interrupts the
+	// retry with the freshly registered one.
+	open := func(u string) error {
+		calls++
+		if calls == 1 {
+			return browserFollow(u)
+		}
+		cancel()
+		return errors.New("no browser")
+	}
+	if _, err := SignIn(ctx, store, "acme", LoginOptions{AuthURL: srv.URL, OpenBrowser: open, Timeout: 10 * time.Second}); err == nil {
+		t.Fatal("interrupted SignIn succeeded")
+	}
+	r, err := store.Load("acme")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if r.ClientID == "" || r.ClientID == "deleted-client" || r.RefreshToken != "" || r.AccessToken != "" || r.Identity != "" {
+		t.Errorf("record = %+v, want only the new client id", r)
+	}
+	if accts, _ := store.Accounts(); len(accts) != 0 {
+		t.Errorf("interrupted account listed: %q", accts)
 	}
 }

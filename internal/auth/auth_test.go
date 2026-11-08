@@ -35,9 +35,11 @@ type fakeAS struct {
 	issued     int
 	refreshes  int
 
-	delay         time.Duration // sleep before answering /auth/token
-	registrations int
-	revokes       int
+	delay           time.Duration // sleep before answering /auth/token
+	registrations   int
+	revokes         int
+	refreshAttempts int // refresh grants received, valid or not
+	refreshRejected int // refresh grants answered with invalid_grant
 }
 
 func newFakeAS(t *testing.T) (*fakeAS, *httptest.Server) {
@@ -124,7 +126,9 @@ func (f *fakeAS) token(w http.ResponseWriter, r *http.Request) {
 		delete(f.challenges, r.Form.Get("code"))
 	case "refresh_token":
 		rt := r.Form.Get("refresh_token")
+		f.refreshAttempts++
 		if !f.refresh[rt] {
+			f.refreshRejected++
 			fail("invalid_grant")
 			return
 		}

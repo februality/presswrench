@@ -62,7 +62,7 @@ func Explain(err error) string {
 		if held.Reason != "" {
 			return "Another PressWrench process holds a newer session it couldn't save: " + held.Reason
 		}
-		return "Another PressWrench process is refreshing the Pressable session. Retry in a moment."
+		return "Another PressWrench process is using the Pressable session. Retry in a moment."
 	}
 	var ce *creds.Error
 	if errors.As(err, &ce) {

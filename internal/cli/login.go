@@ -139,15 +139,22 @@ func NewLogout() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := auth.SignOut(context.Background(), store, account, cfg.AuthURL); err != nil {
-				return err
-			}
-			ui.New(os.Stdout, os.Stdin).Step("Signed out", "account "+auth.AccountLabel(account))
-			return nil
+			return signOut(ui.New(os.Stdout, os.Stdin), store, account, cfg.AuthURL)
 		},
 	}
 	cmd.Flags().StringVar(&account, "account", "", "named account (lowercase slug); omit for the default")
 	return cmd
+}
+
+// signOut signs the account out and prints the outcome. A failure is shown
+// with its fix and returned as a reported error, so logout exits non-zero.
+func signOut(u *ui.UI, store creds.Store, account, authURL string) error {
+	if err := auth.SignOut(context.Background(), store, account, authURL); err != nil {
+		u.Fail("Could not sign out", auth.Explain(err))
+		return ui.Reported(err)
+	}
+	u.Step("Signed out", "account "+auth.AccountLabel(account))
+	return nil
 }
 
 // loadConfigFor loads config as a serve process bound to account would.
