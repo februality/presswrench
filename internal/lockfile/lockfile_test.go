@@ -77,6 +77,63 @@ func TestHeartbeat_KeepsLockFresh(t *testing.T) {
 	}
 }
 
+// A transient failure to open our own lockfile (Windows antivirus holding
+// it) must skip a beat, not stop the heartbeat for good.
+func TestHeartbeat_SurvivesTransientOpenFailure(t *testing.T) {
+	oldH, oldOpen := Heartbeat, openLockFile
+	Heartbeat = 20 * time.Millisecond
+	var failures atomic.Int32
+	failures.Store(3)
+	openLockFile = func(name string) (*os.File, error) {
+		if failures.Add(-1) >= 0 {
+			return nil, &os.PathError{Op: "open", Path: name, Err: errors.New("sharing violation")}
+		}
+		return os.Open(name)
+	}
+	t.Cleanup(func() { Heartbeat, openLockFile = oldH, oldOpen })
+
+	p := lockPath(t)
+	l, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release()
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if st, err := os.Stat(p); err == nil && time.Since(st.ModTime()) < time.Minute {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("heartbeat stopped after a transient open failure")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestHeartbeat_StopsWhenFileIsGone(t *testing.T) {
+	oldH := Heartbeat
+	Heartbeat = 10 * time.Millisecond
+	t.Cleanup(func() { Heartbeat = oldH })
+	p := lockPath(t)
+	l, err := Acquire(context.Background(), p, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-l.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat still running after the lockfile was removed")
+	}
+	l.Release()
+}
+
 func TestHeldError_CarriesReason(t *testing.T) {
 	p := lockPath(t)
 	l, err := Acquire(context.Background(), p, time.Second)

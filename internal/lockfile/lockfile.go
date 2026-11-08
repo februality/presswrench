@@ -54,6 +54,10 @@ type Lock struct {
 	once     sync.Once
 }
 
+// openLockFile opens a lockfile for reading; a var so tests can inject
+// transient failures.
+var openLockFile = os.Open
+
 // idPrefix starts the line that carries the holder's nonce. The file's
 // first line is the reason (possibly empty).
 const idPrefix = "lock-id: "
@@ -194,26 +198,53 @@ func breakIf(path string, judged os.FileInfo, cond func(cur os.FileInfo) bool) b
 	return os.Remove(path) == nil
 }
 
-// ours reports whether path is still the file this lock created: the same
-// file and our nonce (a successor can reuse a freed inode). Caller holds
-// l.mu.
-func (l *Lock) ours() bool {
-	f, err := os.Open(l.path)
+// ownership is what a look at the lockfile says about this lock.
+type ownership int
+
+const (
+	owned    ownership = iota // our file, our nonce
+	notOwned                  // gone, another file, or another nonce
+	unknown                   // couldn't look (e.g. antivirus has it open on Windows)
+)
+
+// check looks at path: is it still the file this lock created, with our
+// nonce (a successor can reuse a freed inode)? Caller holds l.mu.
+func (l *Lock) check() ownership {
+	f, err := openLockFile(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return notOwned
+	}
 	if err != nil {
-		return false
+		return unknown
 	}
 	defer f.Close()
-	return l.oursFile(f)
+	return l.checkFile(f)
 }
 
-func (l *Lock) oursFile(f *os.File) bool {
+func (l *Lock) checkFile(f *os.File) ownership {
 	cur, err := f.Stat()
-	if err != nil || !os.SameFile(l.id, cur) {
-		return false
+	if err != nil {
+		return unknown
+	}
+	if !os.SameFile(l.id, cur) {
+		return notOwned
 	}
 	b, err := io.ReadAll(f)
-	return err == nil && nonceIn(b) == l.nonce
+	if err != nil {
+		return unknown
+	}
+	if nonceIn(b) != l.nonce {
+		return notOwned
+	}
+	return owned
 }
+
+// ours reports whether path is definitely still this lock's file. Unsure
+// counts as no: callers use it before writing under the lock or removing
+// the file. Caller holds l.mu.
+func (l *Lock) ours() bool { return l.check() == owned }
+
+func (l *Lock) oursFile(f *os.File) bool { return l.checkFile(f) == owned }
 
 // Held reports whether this lock is still held: not released and its file
 // not broken or taken over by another process. A nil lock is not held.
@@ -236,9 +267,17 @@ func (l *Lock) beat(every time.Duration) {
 			return
 		case <-t.C:
 			l.mu.Lock()
-			if l.released || !l.ours() {
+			if l.released {
+				l.mu.Unlock()
+				return
+			}
+			switch l.check() {
+			case notOwned:
 				l.mu.Unlock()
 				return // lock was taken over (e.g. after a long stall)
+			case unknown:
+				l.mu.Unlock()
+				continue // transient: look again next beat
 			}
 			now := time.Now()
 			_ = os.Chtimes(l.path, now, now)
