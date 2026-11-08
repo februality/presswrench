@@ -98,14 +98,14 @@ func DefaultFilePath() (string, error) {
 // Open returns the best available Store for this environment: the OS
 // keychain, else the file fallback.
 func Open() (Store, error) {
-	dir, err := ConfigDir()
+	path, err := DefaultFilePath()
 	if err != nil {
 		return nil, err
 	}
 	if raw, info, err := openKeyring(); err == nil {
-		return newRecordStore(raw, info, dir), nil
+		return newRecordStore(raw, info, filepath.Dir(path)), nil
 	}
-	return NewFileStore(filepath.Join(dir, "credentials.json")), nil
+	return NewFileStore(path), nil
 }
 
 // ListAccounts returns every signed-in account in the default store.

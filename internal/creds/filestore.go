@@ -22,9 +22,9 @@ const fileLockWait = 30 * time.Second
 // fileBackend stores raw values in one JSON file at mode 0600:
 // {"v":1,"items":{"<key>":"<value>"}}. Values are the record/index JSON,
 // kept as strings so the file stays readable. Writes are atomic (unique
-// temp file + rename) and serialized across processes by a lockfile next
-// to the file, so two processes saving different accounts can't lose each
-// other's write. Files from earlier builds (no "v") are ignored and
+// temp file + rename) and every access, reads included, is serialized
+// across processes by a lockfile next to the file, so two processes saving
+// different accounts can't lose each other's write. Files from earlier builds (no "v") are ignored and
 // replaced on the next write.
 type fileBackend struct {
 	path string
@@ -125,9 +125,11 @@ func (f *fileBackend) save(env *fileEnvelope) error {
 	return nil
 }
 
-// update runs a read-modify-write of the file under both locks. change
-// reports whether it modified env.
-func (f *fileBackend) update(change func(env *fileEnvelope) bool) error {
+// locked runs fn under the in-process mutex and the cross-process file
+// lock. Reads take it too: on Windows a rename can't replace a file another
+// handle has open, so an unlocked read would make a concurrent write fail.
+// fn must not call get/set/del (the file lock isn't reentrant).
+func (f *fileBackend) locked(fn func() error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	lock, err := lockfile.Acquire(context.Background(), f.path+".lock", fileLockWait)
@@ -135,28 +137,39 @@ func (f *fileBackend) update(change func(env *fileEnvelope) bool) error {
 		return &Error{Kind: KindOther, Err: err}
 	}
 	defer lock.Release()
-	env, err := f.load()
-	if err != nil {
-		return err
-	}
-	if !change(env) {
-		return nil
-	}
-	return f.save(env)
+	return fn()
+}
+
+// update runs a read-modify-write of the file under the locks. change
+// reports whether it modified env.
+func (f *fileBackend) update(change func(env *fileEnvelope) bool) error {
+	return f.locked(func() error {
+		env, err := f.load()
+		if err != nil {
+			return err
+		}
+		if !change(env) {
+			return nil
+		}
+		return f.save(env)
+	})
 }
 
 func (f *fileBackend) get(key string) ([]byte, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	env, err := f.load()
-	if err != nil {
-		return nil, err
-	}
-	v, ok := env.Items[key]
-	if !ok {
-		return nil, &Error{Kind: KindNotFound}
-	}
-	return []byte(v), nil
+	var out []byte
+	err := f.locked(func() error {
+		env, err := f.load()
+		if err != nil {
+			return err
+		}
+		v, ok := env.Items[key]
+		if !ok {
+			return &Error{Kind: KindNotFound}
+		}
+		out = []byte(v)
+		return nil
+	})
+	return out, err
 }
 
 func (f *fileBackend) set(key, _ string, value []byte) error {

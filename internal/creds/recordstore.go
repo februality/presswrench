@@ -112,6 +112,11 @@ func (s *recordStore) Save(account string, r Record) error {
 		return s.fail("save", account, err)
 	}
 	name := storageName(account)
+	// Unlocked fast path, so steady-state saves skip the index lock. It can
+	// race heal (heal sees the record absent, we write it, read the stale
+	// index, heal drops the name): the record is then unindexed until its
+	// next Save, which re-adds it. Needs a crash-left ghost plus a re-login
+	// at that instant, so it's accepted.
 	if names, err := s.readIndex(); err == nil && slices.Contains(names, name) {
 		return nil
 	}

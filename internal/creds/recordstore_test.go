@@ -190,6 +190,27 @@ func TestAccounts_SelfHealsIndex(t *testing.T) {
 	}
 }
 
+// An indexed account whose record exists but can't be read (corrupt,
+// locked keychain) stays listed, so status shows the real problem instead
+// of "not signed in"; an indexed account whose record is gone is not.
+func TestAccounts_ListsUnreadableNotAbsent(t *testing.T) {
+	raw, s := newFakeStore(t)
+	must(t, s.Save("ok", Record{ClientID: "c", RefreshToken: "r"}))
+	must(t, raw.set(sessionKey("broken"), "", []byte("not json")))
+	must(t, raw.set(sessionKey("locked"), "", []byte(`{"v":1,"refresh_token":"r"}`)))
+	raw.getErr[sessionKey("locked")] = &Error{Kind: KindLocked}
+	must(t, raw.set(indexKey, "", []byte(`{"v":1,"accounts":["absent","broken","locked","ok"]}`)))
+
+	accts, err := s.Accounts()
+	must(t, err)
+	if want := []string{"broken", "locked", "ok"}; !reflect.DeepEqual(accts, want) {
+		t.Errorf("accounts = %q, want %q", accts, want)
+	}
+	if idx := raw.indexNames(t); !reflect.DeepEqual(idx, []string{"broken", "locked", "ok"}) {
+		t.Errorf("index = %q: only the absent record should be dropped", idx)
+	}
+}
+
 func TestAccounts_ConcurrentSavesBothIndexed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	stores := []Store{NewFileStore(path), NewFileStore(path)}
