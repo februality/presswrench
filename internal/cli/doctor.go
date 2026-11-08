@@ -44,8 +44,17 @@ func runDoctor(u *ui.UI, site string) error {
 	}
 	fmt.Println()
 
-	accts := discoveredAccounts(store)
+	accts, listErr := discoveredAccounts(store)
+	storeProblem := openErr
+	if openErr == nil && listErr != nil {
+		u.Warn("Could not list the stored accounts", auth.Explain(listErr))
+		storeProblem = listErr
+	}
 	if len(accts) == 0 && os.Getenv(auth.EnvAccessToken) == "" {
+		if storeProblem != nil {
+			// The problem is already shown; don't claim there are no accounts.
+			return ui.Reported(storeProblem)
+		}
 		u.Fail("No accounts configured", "run presswrench setup")
 		return errors.New("not signed in")
 	}

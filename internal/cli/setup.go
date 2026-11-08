@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/februality/presswrench/internal/clients"
+	"github.com/februality/presswrench/internal/creds"
 	"github.com/februality/presswrench/internal/wizard"
 )
 
@@ -44,6 +45,7 @@ func NewSetup() *cobra.Command {
 				SkipClients: skipClients,
 				OnlyClients: onlyClients,
 				ReadOnly:    readOnly,
+				OpenStore:   func() (creds.Store, error) { return openStore() },
 			}
 			if cmd.Flags().Changed("blocked-operations") {
 				opts.BlockedOperations = &blocked

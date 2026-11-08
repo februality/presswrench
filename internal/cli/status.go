@@ -24,9 +24,11 @@ type statusOutput struct {
 	BinaryPath string `json:"binaryPath"`
 	// Store describes the credential store in use; StoreWarning says why it
 	// is degraded (for example the file fallback), when it is.
-	Store        string          `json:"store"`
-	StoreWarning string          `json:"storeWarning,omitempty"`
-	Accounts     []accountStatus `json:"accounts"`
+	Store        string `json:"store"`
+	StoreWarning string `json:"storeWarning,omitempty"`
+	// AccountsProblem is why the stored accounts couldn't be listed.
+	AccountsProblem string          `json:"accountsProblem,omitempty"`
+	Accounts        []accountStatus `json:"accounts"`
 	// ReadOnlyEnv reflects PRESSWRENCH_READ_ONLY in the current shell — only useful
 	// if the user happens to have it set when running `status`. The per-
 	// client `readOnly` field is the authoritative signal.
@@ -95,12 +97,13 @@ func NewStatus() *cobra.Command {
 
 // discoveredAccounts returns every account name with either a stored
 // session or at least one client-config entry. Default ("") sorts first.
-func discoveredAccounts(store creds.Store) []string {
+// A store that can't list its accounts is returned as the error; the
+// accounts found in client configs are still returned.
+func discoveredAccounts(store creds.Store) ([]string, error) {
 	seen := map[string]struct{}{}
-	if accts, err := store.Accounts(); err == nil {
-		for _, a := range accts {
-			seen[a] = struct{}{}
-		}
+	accts, listErr := store.Accounts()
+	for _, a := range accts {
+		seen[a] = struct{}{}
 	}
 	for _, p := range clients.All("") {
 		entries, err := p.Entries()
@@ -116,7 +119,7 @@ func discoveredAccounts(store creds.Store) []string {
 		out = append(out, name)
 	}
 	sort.Strings(out)
-	return out
+	return out, listErr
 }
 
 func buildStatus() statusOutput {
@@ -132,7 +135,13 @@ func buildStatus() statusOutput {
 	}
 	info := store.Info()
 	out.Store, out.StoreWarning = info.Description, info.Warning
-	accts := discoveredAccounts(store)
+	accts, listErr := discoveredAccounts(store)
+	if err != nil {
+		// The open failure is the problem; don't repeat it as a list failure.
+		out.StoreWarning = auth.Explain(err)
+	} else if listErr != nil {
+		out.AccountsProblem = auth.Explain(listErr)
+	}
 	if len(accts) == 0 {
 		// No state at all — surface the default account row so `status`
 		// after a fresh install still has something to print.
@@ -189,6 +198,9 @@ func printStatusHuman(u *ui.UI, s statusOutput) {
 	fmt.Printf("Credentials: %s\n", s.Store)
 	if s.StoreWarning != "" {
 		fmt.Printf("             %s %s\n", u.Mark(ui.Warn), s.StoreWarning)
+	}
+	if s.AccountsProblem != "" {
+		fmt.Printf("             %s Could not list the stored accounts: %s\n", u.Mark(ui.Warn), s.AccountsProblem)
 	}
 	fmt.Println()
 

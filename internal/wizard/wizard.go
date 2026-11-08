@@ -29,10 +29,13 @@ import (
 
 // Options configure a wizard run.
 type Options struct {
-	Out         io.Writer
-	UI          *ui.UI   // nil → ui.New(Out, os.Stdin)
-	Prompter    Prompter // nil → UI
-	Hooks       *Hooks   // nil → DefaultHooks
+	Out      io.Writer
+	UI       *ui.UI   // nil → ui.New(Out, os.Stdin)
+	Prompter Prompter // nil → UI
+	Hooks    *Hooks   // nil → DefaultHooks
+	// OpenStore opens the credential store when Hooks is nil; nil → creds.Open.
+	// A failure is shown with its fix and returned as a reported error.
+	OpenStore   func() (creds.Store, error)
 	Account     string   // "" = default account; otherwise a named account slug
 	Unattended  bool     // skip prompts; requires an existing session or PRESSWRENCH_ACCESS_TOKEN
 	ManualLogin bool     // paste the redirect URL instead of using a loopback listener
@@ -81,9 +84,14 @@ func Run(opts Options) error {
 		return err
 	}
 	if opts.Hooks == nil {
-		store, err := creds.Open()
+		open := opts.OpenStore
+		if open == nil {
+			open = creds.Open
+		}
+		store, err := open()
 		if err != nil {
-			return fmt.Errorf("open credentials store: %w", err)
+			u.Fail("Could not open the credentials store", auth.Explain(err))
+			return ui.Reported(err)
 		}
 		opts.Hooks = DefaultHooks(cfg, store)
 	}

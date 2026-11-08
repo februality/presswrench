@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -44,8 +45,12 @@ func TestBuildAccountStatus_LockedKeychain(t *testing.T) {
 	if as.Session.SignedIn {
 		t.Fatal("SignedIn with a locked keychain")
 	}
-	if !strings.Contains(as.Session.Problem, "unlock") {
-		t.Fatalf("Problem = %q", as.Session.Problem)
+	want := "The system keyring is locked"
+	if runtime.GOOS == "darwin" {
+		want = "security unlock-keychain"
+	}
+	if !strings.Contains(as.Session.Problem, want) {
+		t.Fatalf("Problem = %q, want it to contain %q", as.Session.Problem, want)
 	}
 }
 
@@ -87,9 +92,8 @@ func TestPrintStatusHuman_StoreOnceAndProblem(t *testing.T) {
 			{Name: "b"},
 		},
 	}
-	var buf bytes.Buffer
-	// printStatusHuman writes to stdout via fmt; capture through the UI only for marks.
-	u := ui.NewTest(&buf, false, false, 80)
+	// printStatusHuman writes to stdout via fmt; the UI only supplies marks.
+	u := ui.NewTest(&bytes.Buffer{}, false, false, 80)
 	got := captureStdout(t, func() { printStatusHuman(u, s) })
 	if n := strings.Count(got, "Credentials:"); n != 1 {
 		t.Fatalf("Credentials lines = %d\n%s", n, got)
@@ -110,10 +114,84 @@ func captureStdout(t *testing.T, f func()) string {
 		t.Fatal(err)
 	}
 	os.Stdout = w
+	done := make(chan string)
+	go func() {
+		var b bytes.Buffer
+		_, _ = b.ReadFrom(r)
+		done <- b.String()
+	}()
 	defer func() { os.Stdout = old }()
 	f()
 	_ = w.Close()
-	var b bytes.Buffer
-	_, _ = b.ReadFrom(r)
-	return b.String()
+	return <-done
+}
+
+func failOpen(t *testing.T) {
+	t.Helper()
+	old := openStore
+	openStore = func() (creds.Store, error) {
+		return nil, &creds.Error{Kind: creds.KindUnavailable, Detail: "no dbus"}
+	}
+	t.Cleanup(func() { openStore = old })
+}
+
+func TestRunDoctor_DegradedStoreWarns(t *testing.T) {
+	isolate(t)
+	useStore(t, infoStore{tempStore(t), creds.Info{Source: creds.SourceFile, Description: "file /x (keyring unavailable: no dbus)"}})
+	var buf bytes.Buffer
+	_ = captureStdout(t, func() { _ = runDoctor(ui.NewTest(&buf, false, false, 100), "") })
+	if !strings.Contains(buf.String(), "▲") && !strings.Contains(buf.String(), "!") {
+		t.Fatalf("no warn mark:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "keyring unavailable") {
+		t.Fatalf("store not shown:\n%s", buf.String())
+	}
+}
+
+func TestRunDoctor_OpenFailureDoesNotClaimNoAccounts(t *testing.T) {
+	isolate(t)
+	failOpen(t)
+	var buf bytes.Buffer
+	var err error
+	_ = captureStdout(t, func() { err = runDoctor(ui.NewTest(&buf, false, false, 100), "") })
+	if err == nil || !ui.IsReported(err) {
+		t.Fatalf("err = %v, want a reported store error", err)
+	}
+	if strings.Contains(buf.String(), "No accounts configured") || strings.Contains(err.Error(), "not signed in") {
+		t.Fatalf("claimed no accounts:\n%s\n%v", buf.String(), err)
+	}
+	if !strings.Contains(buf.String(), "PRESSWRENCH_CREDENTIAL_STORE=file") {
+		t.Fatalf("missing fix:\n%s", buf.String())
+	}
+}
+
+func TestAccountsList_StoreErrorNoClients(t *testing.T) {
+	withTempHome(t)
+	isolate(t)
+	failOpen(t)
+	cmd := NewAccounts()
+	cmd.SetArgs([]string{"list"})
+	var err error
+	out := captureStdout(t, func() { err = cmd.Execute() })
+	if err == nil || !ui.IsReported(err) {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(out, "No accounts configured") || !strings.Contains(out, "Could not read the stored sessions") {
+		t.Fatalf("output:\n%s", out)
+	}
+}
+
+func TestSetup_OpenStoreFailureIsExplained(t *testing.T) {
+	isolate(t)
+	failOpen(t)
+	cmd := NewSetup()
+	cmd.SetArgs([]string{"--unattended", "--skip-ssh", "--skip-clients"})
+	var err error
+	out := captureStdout(t, func() { err = cmd.Execute() })
+	if err == nil || !ui.IsReported(err) {
+		t.Fatalf("err = %v, want reported", err)
+	}
+	if !strings.Contains(out, "PRESSWRENCH_CREDENTIAL_STORE=file") || strings.Contains(out, "open credentials store:") {
+		t.Fatalf("output:\n%s", out)
+	}
 }

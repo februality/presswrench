@@ -52,6 +52,9 @@ func newAccountsList() *cobra.Command {
 					return err
 				}
 				fmt.Println(string(b))
+				if listErr != nil {
+					return ui.Reported(listErr)
+				}
 				return nil
 			}
 			u := ui.New(os.Stdout, os.Stdin)
@@ -60,6 +63,10 @@ func newAccountsList() *cobra.Command {
 				u.Warn("Could not read the stored sessions", auth.Explain(listErr))
 			}
 			if len(rows) == 0 {
+				if listErr != nil {
+					// Don't claim there are none: they couldn't be read.
+					return ui.Reported(listErr)
+				}
 				u.Skip("No accounts configured", "run presswrench setup")
 				return nil
 			}
@@ -76,6 +83,9 @@ func newAccountsList() *cobra.Command {
 				// The mark is one visible cell; pad by hand since it may
 				// carry colour codes.
 				fmt.Printf("%-20s  %s%s  %s\n", auth.AccountLabel(r.Name), cred, strings.Repeat(" ", 11), entries)
+			}
+			if listErr != nil {
+				return ui.Reported(listErr)
 			}
 			return nil
 		},
