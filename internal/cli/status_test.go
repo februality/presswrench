@@ -2,13 +2,16 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/februality/presswrench/internal/config"
 	"github.com/februality/presswrench/internal/creds"
+	"github.com/februality/presswrench/internal/mcpserver"
 	"github.com/februality/presswrench/internal/ui"
 )
 
@@ -193,5 +196,26 @@ func TestSetup_OpenStoreFailureIsExplained(t *testing.T) {
 	}
 	if !strings.Contains(out, "PRESSWRENCH_CREDENTIAL_STORE=file") || strings.Contains(out, "open credentials store:") {
 		t.Fatalf("output:\n%s", out)
+	}
+}
+
+// doctor closes the session it builds, so a session that couldn't save
+// never keeps the account lock after doctor exits.
+func TestDoctorAccount_ClosesSession(t *testing.T) {
+	isolate(t)
+	var deps *mcpserver.Deps
+	old := buildDeps
+	buildDeps = func(c *config.Config, st creds.Store) *mcpserver.Deps {
+		deps = old(c, st)
+		return deps
+	}
+	t.Cleanup(func() { buildDeps = old })
+	var buf bytes.Buffer
+	_ = captureStdout(t, func() { _ = doctorAccount(ui.NewTest(&buf, false, false, 100), tempStore(t), "", "") })
+	if deps == nil {
+		t.Fatal("doctor built no deps")
+	}
+	if _, err := deps.Session.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "shutting down") {
+		t.Errorf("session not closed: Token err = %v", err)
 	}
 }

@@ -37,23 +37,37 @@ type Hooks struct {
 	// PollDelay separates SSH-login polling attempts: 10 s in production,
 	// 0 in tests.
 	PollDelay time.Duration
+	// Close releases what the hooks built (sessions, SSH connections); Run
+	// calls it when it returns. Optional.
+	Close func()
 }
+
+// Seams for tests.
+var (
+	newSession = auth.NewSession
+	buildDeps  = mcpserver.Build
+)
 
 // DefaultHooks builds the production hooks. The MCP dependencies (gateway,
 // SSH) are created on first use so they see the session that sign-in
 // stores.
 func DefaultHooks(cfg *config.Config, store creds.Store) *Hooks {
 	var (
-		once sync.Once
+		mu   sync.Mutex
 		deps *mcpserver.Deps
 	)
 	build := func() *mcpserver.Deps {
-		once.Do(func() { deps = mcpserver.Build(cfg, store) })
+		mu.Lock()
+		defer mu.Unlock()
+		if deps == nil {
+			deps = buildDeps(cfg, store)
+		}
 		return deps
 	}
 	h := &Hooks{
 		Session: func(ctx context.Context) (string, error) {
-			s := auth.NewSession(store, cfg.Account, cfg.AuthURL)
+			s := newSession(store, cfg.Account, cfg.AuthURL)
+			defer s.Close() // releases the lock of a session that couldn't save
 			if _, err := s.Token(ctx); err != nil {
 				return "", err
 			}
@@ -75,6 +89,15 @@ func DefaultHooks(cfg *config.Config, store creds.Store) *Hooks {
 		Patchers:  clients.All,
 		Official:  clients.FindOfficial,
 		PollDelay: 10 * time.Second,
+		Close: func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if deps != nil {
+				deps.Session.Close()
+				deps.SSHPool.Close()
+				deps = nil
+			}
+		},
 	}
 	if store != nil {
 		if info := store.Info(); info.Source == creds.SourceFile {

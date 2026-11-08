@@ -77,14 +77,18 @@ func runDoctor(u *ui.UI, site string) error {
 	return firstErr
 }
 
+// buildDeps is mcpserver.Build; tests replace it to inspect the deps.
+var buildDeps = mcpserver.Build
+
 func doctorAccount(u *ui.UI, store creds.Store, account, site string) error {
 	ctx := context.Background()
 	cfg, err := loadConfigFor(account)
 	if err != nil {
 		return err
 	}
-	deps := mcpserver.Build(cfg, store)
+	deps := buildDeps(cfg, store)
 	defer deps.SSHPool.Close()
+	defer deps.Session.Close() // releases the lock of a session that couldn't save
 
 	if _, err := deps.Session.Token(ctx); err != nil {
 		u.Fail(auth.Explain(err), "")

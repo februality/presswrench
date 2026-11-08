@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/februality/presswrench/internal/config"
+	"github.com/februality/presswrench/internal/creds"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -557,5 +560,52 @@ func TestRun_ASCIIModeIsPureASCII(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "o  SSH key - ") {
 		t.Fatalf("ascii separator missing:\n%s", buf.String())
+	}
+}
+
+func TestRun_ClosesHooks(t *testing.T) {
+	h := fakeHooks()
+	closed := 0
+	h.Close = func() { closed++ }
+	if r := run(t, true, Options{SkipSSH: true, SkipClients: true}, h, &scriptedPrompter{}); r.err != nil {
+		t.Fatal(r.err)
+	}
+	if closed != 1 {
+		t.Errorf("Close called %d times, want 1", closed)
+	}
+}
+
+// The sessions the default hooks create are closed, so a session that
+// couldn't save never keeps the account lock after setup.
+func TestDefaultHooks_CloseSessions(t *testing.T) {
+	t.Setenv("PRESSWRENCH_ACCESS_TOKEN", "")
+	store := creds.NewFileStore(filepath.Join(t.TempDir(), "creds.json"))
+	cfg := &config.Config{MCPURL: "http://127.0.0.1:1", AuthURL: "http://127.0.0.1:1"}
+
+	var sessions []*auth.Session
+	oldNew, oldBuild := newSession, buildDeps
+	newSession = func(st creds.Store, account, authURL string) *auth.Session {
+		s := oldNew(st, account, authURL)
+		sessions = append(sessions, s)
+		return s
+	}
+	buildDeps = func(c *config.Config, st creds.Store) *mcpserver.Deps {
+		d := oldBuild(c, st)
+		sessions = append(sessions, d.Session)
+		return d
+	}
+	t.Cleanup(func() { newSession, buildDeps = oldNew, oldBuild })
+
+	h := DefaultHooks(cfg, store)
+	_, _ = h.Session(context.Background())
+	_, _ = h.ListSites(context.Background())
+	h.Close()
+	if len(sessions) != 2 {
+		t.Fatalf("%d sessions created, want 2", len(sessions))
+	}
+	for i, s := range sessions {
+		if _, err := s.Token(context.Background()); err == nil || !strings.Contains(err.Error(), "shutting down") {
+			t.Errorf("session %d not closed: Token err = %v", i, err)
+		}
 	}
 }

@@ -96,6 +96,9 @@ func Run(opts Options) error {
 		opts.Hooks = DefaultHooks(cfg, store)
 	}
 	h := opts.Hooks
+	if h.Close != nil {
+		defer h.Close()
+	}
 
 	u.Intro("PressWrench setup", "v"+mcpserver.ServerVersion)
 	if opts.Account != "" {
