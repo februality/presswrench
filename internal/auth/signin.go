@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -38,6 +39,9 @@ func SignIn(ctx context.Context, store creds.Store, account string, o LoginOptio
 	// A new login replaces any previous session wholesale.
 	if err := saveTokens(store, account, tr, time.Now(), true); err != nil {
 		return nil, err
+	}
+	if err := creds.RememberBackend(store); err != nil {
+		slog.Warn("could not remember the credential store", "error", err)
 	}
 	return tr, nil
 }

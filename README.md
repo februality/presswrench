@@ -276,6 +276,7 @@ All optional. `setup` and `install` write the relevant ones into the AI tool's c
 | `PRESSWRENCH_BLOCKED_OPERATIONS` | `delete_site` | Comma-separated operations to refuse; `none` blocks nothing |
 | `PRESSWRENCH_ACCOUNT` | unset | Named login to use (set by `--account`) |
 | `PRESSWRENCH_ACCESS_TOKEN` | unset | Use this token instead of the stored session (CI and containers; not refreshed) |
+| `PRESSWRENCH_CREDENTIAL_STORE` | unset | `keyring` or `file`: where the session is kept (default: keyring, else file; remembered after sign-in) |
 | `PRESSWRENCH_SSH_KEY_PATH` | `~/.ssh/presswrench` | Private key for site access |
 | `PRESSWRENCH_SSH_KEY_LABEL` | `presswrench` | The key's name in MyPressable |
 | `PRESSWRENCH_KNOWN_HOSTS_PATH` | `~/.ssh/presswrench_known_hosts` | Pinned SSH host keys |
