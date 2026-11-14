@@ -116,11 +116,17 @@ func Explain(err error) string {
 			}
 			return "The system keyring isn't available (" + ce.Detail + "). Start it, or set PRESSWRENCH_CREDENTIAL_STORE=file and sign in again with `" + bareLoginCommand(ce.Account) + "`."
 		case creds.KindCorrupt:
+			if ce.Op == "file" {
+				return "PressWrench's credentials file is damaged (" + ce.Detail + "). Delete it, then sign in again with `" + LoginCommand(ce.Account) + "` (and once per other account)."
+			}
 			if ce.Op == "index" {
 				return "PressWrench's list of signed-in accounts is damaged. Sign in again with `" + LoginCommand("") + "` (and `--account <name>` for other accounts) to rebuild it."
 			}
 			return "The stored PressWrench session for account " + label + " is damaged. Run " + cmd + " to sign in again."
 		case creds.KindNewerFormat:
+			if ce.Op == "file" {
+				return "PressWrench's credentials file was saved by a newer PressWrench (" + ce.Detail + "). Upgrade PressWrench."
+			}
 			if ce.Op == "index" {
 				return "PressWrench's list of signed-in accounts was saved by a newer PressWrench. Upgrade PressWrench."
 			}

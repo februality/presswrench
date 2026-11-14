@@ -362,3 +362,32 @@ func TestAccounts_CorruptIndexIsAnIndexError(t *testing.T) {
 		t.Fatalf("Accounts = %q, %v", got, err)
 	}
 }
+
+// A damaged or newer credentials file isn't one record's problem: every
+// load, save and listing reports it with Op "file", because signing in again
+// (a save) can't get past it.
+func TestFileStore_DamagedFileIsAFileError(t *testing.T) {
+	for _, c := range []struct {
+		content string
+		kind    Kind
+	}{
+		{"{not json", KindCorrupt},
+		{`{"v":1,"items":[1]}`, KindCorrupt},
+		{`{"v":99,"items":{}}`, KindNewerFormat},
+	} {
+		path := filepath.Join(t.TempDir(), "credentials.json")
+		if err := os.WriteFile(path, []byte(c.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s := NewFileStore(path)
+		_, lerr := s.Load("acme")
+		serr := s.Save("acme", Record{RefreshToken: "r"})
+		_, aerr := s.Accounts()
+		for name, err := range map[string]error{"load": lerr, "save": serr, "accounts": aerr} {
+			var e *Error
+			if !errors.As(err, &e) || e.Kind != c.kind || e.Op != "file" {
+				t.Errorf("%q %s: err = %#v, want Kind %v Op file", c.content, name, err, c.kind)
+			}
+		}
+	}
+}

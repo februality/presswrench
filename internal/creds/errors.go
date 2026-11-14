@@ -28,7 +28,7 @@ var ErrNotFound = errors.New("credential not found")
 type Error struct {
 	Kind    Kind
 	Account string // "" is the default account
-	Op      string // "open", "load", "save", "delete", "list", "index"
+	Op      string // "open", "load", "save", "delete", "list", "index", "marker", "file"
 	Backend Source
 	Detail  string
 	Err     error

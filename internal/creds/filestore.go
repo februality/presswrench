@@ -62,20 +62,22 @@ func (f *fileBackend) load() (*fileEnvelope, error) {
 	if len(bytes.TrimSpace(b)) == 0 {
 		return env, nil
 	}
+	// Errors about the whole file carry Op "file": every write re-reads it,
+	// so signing in again can't repair them.
 	var probe struct {
 		V int `json:"v"`
 	}
 	if err := json.Unmarshal(b, &probe); err != nil {
-		return nil, &Error{Kind: KindCorrupt, Detail: "credentials file " + f.path + " is not valid JSON", Err: err}
+		return nil, &Error{Kind: KindCorrupt, Op: "file", Detail: "credentials file " + f.path + " is not valid JSON", Err: err}
 	}
 	if probe.V > fileVersion {
-		return nil, &Error{Kind: KindNewerFormat, Detail: fmt.Sprintf("credentials file %s has format %d, this build reads %d", f.path, probe.V, fileVersion)}
+		return nil, &Error{Kind: KindNewerFormat, Op: "file", Detail: fmt.Sprintf("credentials file %s has format %d, this build reads %d", f.path, probe.V, fileVersion)}
 	}
 	if probe.V < 1 {
 		return env, nil // earlier development builds: ignored
 	}
 	if err := json.Unmarshal(b, env); err != nil {
-		return nil, &Error{Kind: KindCorrupt, Detail: "credentials file " + f.path + " has unexpected contents", Err: err}
+		return nil, &Error{Kind: KindCorrupt, Op: "file", Detail: "credentials file " + f.path + " has unexpected contents", Err: err}
 	}
 	if env.Items == nil {
 		env.Items = map[string]string{}

@@ -107,6 +107,10 @@ func TestExplain_FileDeniedAndIndex(t *testing.T) {
 			"PressWrench's list of signed-in accounts is damaged. Sign in again with `presswrench login` (and `--account <name>` for other accounts) to rebuild it."},
 		{&creds.Error{Kind: creds.KindNewerFormat, Op: "index"},
 			"PressWrench's list of signed-in accounts was saved by a newer PressWrench. Upgrade PressWrench."},
+		{&creds.Error{Kind: creds.KindCorrupt, Op: "file", Account: "acme", Detail: "credentials file /x/credentials.json is not valid JSON"},
+			"PressWrench's credentials file is damaged (credentials file /x/credentials.json is not valid JSON). Delete it, then sign in again with `presswrench login --account acme` (and once per other account)."},
+		{&creds.Error{Kind: creds.KindNewerFormat, Op: "file", Detail: "credentials file /x/credentials.json has format 2, this build reads 1"},
+			"PressWrench's credentials file was saved by a newer PressWrench (credentials file /x/credentials.json has format 2, this build reads 1). Upgrade PressWrench."},
 	}
 	for _, c := range cases {
 		if got := Explain(c.err); got != c.want {
