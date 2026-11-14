@@ -76,6 +76,32 @@ func (e *OAuthError) Error() string {
 	return fmt.Sprintf("Pressable OAuth error %d %s", e.Status, e.Code)
 }
 
+// oauthCodes are the RFC 6749 §5.2 token-endpoint error codes.
+var oauthCodes = map[string]bool{
+	"invalid_request": true, "invalid_client": true, "invalid_grant": true,
+	"unauthorized_client": true, "unsupported_grant_type": true, "invalid_scope": true,
+}
+
+// decodeOAuthError reads a token-endpoint error body. Besides the RFC 6749
+// shape ({"error": ..., "error_description": ...}) it accepts Pressable's
+// actual one, {"message": "invalid_grant", "errors": ["User credentials or
+// grant type are invalid"]} (seen 2026-11-13), when message is an RFC code.
+// Anything else becomes "http_error" with the body as the description.
+func decodeOAuthError(status int, raw []byte) *OAuthError {
+	oe := &OAuthError{Status: status}
+	if json.Unmarshal(raw, oe) == nil && oe.Code != "" {
+		return oe
+	}
+	var alt struct {
+		Message string   `json:"message"`
+		Errors  []string `json:"errors"`
+	}
+	if json.Unmarshal(raw, &alt) == nil && oauthCodes[alt.Message] {
+		return &OAuthError{Status: status, Code: alt.Message, Description: strings.Join(alt.Errors, "; ")}
+	}
+	return &OAuthError{Status: status, Code: "http_error", Description: truncate(string(raw), 300)}
+}
+
 func redirectURI(port int) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 }
@@ -283,12 +309,7 @@ func exchange(ctx context.Context, hc *http.Client, authURL string, form url.Val
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode/100 != 2 {
-		oe := &OAuthError{Status: resp.StatusCode}
-		if json.Unmarshal(raw, oe) != nil || oe.Code == "" {
-			oe.Code = "http_error"
-			oe.Description = truncate(string(raw), 300)
-		}
-		return nil, oe
+		return nil, decodeOAuthError(resp.StatusCode, raw)
 	}
 	var tr TokenResponse
 	if err := json.Unmarshal(raw, &tr); err != nil || tr.AccessToken == "" {

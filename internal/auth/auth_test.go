@@ -108,9 +108,10 @@ func (f *fakeAS) token(w http.ResponseWriter, r *http.Request) {
 	time.Sleep(delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Pressable's real error envelope, not RFC 6749's {"error": code}.
 	fail := func(code string) {
 		w.WriteHeader(400)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+		_ = json.NewEncoder(w).Encode(map[string]any{"message": code, "data": nil, "errors": []string{"User credentials or grant type are invalid"}})
 	}
 	if !f.clients[r.Form.Get("client_id")] {
 		fail("invalid_client")
