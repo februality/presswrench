@@ -51,6 +51,7 @@ func TestKeychainStore_RealKeychain(t *testing.T) {
 	if os.Getenv("PRESSWRENCH_KEYCHAIN_TEST") != "1" {
 		t.Skip("set PRESSWRENCH_KEYCHAIN_TEST=1 to run against the real keychain")
 	}
+	t.Setenv("HOME", realHome)
 	if _, _, err := openKeyring(); err != nil {
 		t.Fatal(err)
 	}
