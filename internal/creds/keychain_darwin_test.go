@@ -93,3 +93,8 @@ func TestKeychainStore_RealKeychain(t *testing.T) {
 		t.Errorf("after delete: err = %v", err)
 	}
 }
+
+// realHome is HOME before TestMain replaced it. The opt-in real-keychain
+// test restores it: /usr/bin/security finds the login keychain through HOME,
+// and under the temp HOME it fails to create items (exit 154, -60006).
+var realHome = os.Getenv("HOME")

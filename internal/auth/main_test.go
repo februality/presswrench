@@ -18,13 +18,13 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	for _, k := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA"} {
-		os.Setenv(k, dir)
+		_ = os.Setenv(k, dir)
 	}
 	for _, k := range []string{"PRESSWRENCH_ACCESS_TOKEN", "PRESSWRENCH_CREDENTIAL_STORE", "PRESSWRENCH_ACCOUNT"} {
-		os.Unsetenv(k)
+		_ = os.Unsetenv(k)
 	}
 	code := m.Run()
-	os.RemoveAll(dir)
+	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }
 
