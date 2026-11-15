@@ -217,12 +217,12 @@ func TestWriteRemote(t *testing.T) {
 }
 
 func TestRemoteCommand(t *testing.T) {
-	const watchdog = "(cat <&3; kill -0 $$ && kill -KILL 0) >/dev/null 2>&1 & } 2>/dev/null | {\n"
+	const watchdog = "(cat <&3; kill -0 $$ && kill -KILL 0) >/dev/null 2>&1 & } | {\n"
 	if got, want := remoteCommand("ls", ExecOptions{}), "exec 3<&0\n{ "+watchdog+"ls\n} 3<&-"; got != want {
 		t.Errorf("bare:\n got %q\nwant %q", got, want)
 	}
 	got := remoteCommand("a; b", ExecOptions{Cwd: "/srv/htdocs", Stdin: "12345", TimeoutMs: 1500})
-	want := "exec 3<&0\n{ head -c 5 <&3; " + watchdog + "cd '/srv/htdocs' || exit 1\na; b\n} 3<&-"
+	want := "exec 3<&0\n{ head -c 5 <&3 2>/dev/null; " + watchdog + "cd '/srv/htdocs' || exit 1\na; b\n} 3<&-"
 	if got != want {
 		t.Errorf("cwd + stdin:\n got %q\nwant %q", got, want)
 	}

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -214,9 +215,12 @@ func remoteCommand(command string, opts ExecOptions) string {
 	var b strings.Builder
 	b.WriteString("exec 3<&0\n{ ")
 	if n := len(opts.Stdin); n > 0 {
-		fmt.Fprintf(&b, "head -c %d <&3; ", n)
+		fmt.Fprintf(&b, "head -c %d <&3 2>/dev/null; ", n)
 	}
-	b.WriteString("(cat <&3; kill -0 $$ && kill -KILL 0) >/dev/null 2>&1 & } 2>/dev/null | {\n")
+	// No redirection on this group: dash would save the real stderr on a
+	// spare descriptor, the watchdog would inherit it, and a server that
+	// waits for the output pipes to close would never see the command end.
+	b.WriteString("(cat <&3; kill -0 $$ && kill -KILL 0) >/dev/null 2>&1 & } | {\n")
 	if opts.Cwd != "" {
 		// "|| exit" on its own line, not "&&": with a multi-statement
 		// command, "cd X && a; b" would still run b in the wrong place.
@@ -907,7 +911,9 @@ func writeRemoteIf(c *sftp.Client, remote, display string, src io.Reader, create
 		}
 		mode = st.Mode().Perm()
 	}
-	tmp := target + ".presswrench-" + strconv.FormatInt(time.Now().UnixNano(), 36) + ".tmp"
+	// The clock alone is not unique: Windows ticks coarsely enough for two
+	// writes to get the same name.
+	tmp := target + ".presswrench-" + strconv.FormatInt(time.Now().UnixNano(), 36) + strconv.FormatUint(tmpSeq.Add(1), 36) + ".tmp"
 	f, err := c.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
 		return fail(err)
@@ -935,6 +941,9 @@ func writeRemoteIf(c *sftp.Client, remote, display string, src io.Reader, create
 	}
 	return n, nil
 }
+
+// tmpSeq tells apart temp files made in the same clock tick.
+var tmpSeq atomic.Uint64
 
 // mover is the part of *sftp.Client replaceFile uses.
 type mover interface {

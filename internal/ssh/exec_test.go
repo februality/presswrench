@@ -30,7 +30,9 @@ type sshServer struct {
 	// stubborn makes it behave like Pressable's sshd: the "signal" request
 	// is ignored and a command keeps running after its channel closes.
 	stubborn bool
-	files    sftp.Handlers
+	// shell runs the commands; "sh" when empty.
+	shell atomic.Value
+	files sftp.Handlers
 }
 
 func startSSHServer(t *testing.T, stubborn bool) *sshServer {
@@ -105,7 +107,11 @@ func (srv *sshServer) session(ch xssh.Channel, reqs <-chan *xssh.Request) {
 			case "exec":
 				var payload struct{ Command string }
 				_ = xssh.Unmarshal(req.Payload, &payload)
-				cmd = exec.Command("sh", "-c", payload.Command)
+				shell, _ := srv.shell.Load().(string)
+				if shell == "" {
+					shell = "sh"
+				}
+				cmd = exec.Command(shell, "-c", payload.Command)
 				cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 				cmd.Stdout, cmd.Stderr = ch, ch.Stderr()
 				stdin, _ := cmd.StdinPipe()
@@ -529,5 +535,41 @@ func TestOps_LaterPagesSeek(t *testing.T) {
 	}
 	if page, err = ops.ReadFile(ctx, host, user, "big.log", ReadOptions{Offset: 2}); err != nil || page.Content != "two lines now\n" || page.TotalLines != 2 {
 		t.Fatalf("after the file changed: %+v, %v", page, err)
+	}
+}
+
+// The wrapper must behave the same under every shell a server may give
+// us. dash once kept the output pipes open through the watchdog, so a
+// finished command never ended (Linux CI, where sh is dash).
+func TestExec_UnderEachShell(t *testing.T) {
+	for _, shell := range []string{"dash", "bash", "zsh"} {
+		path, err := exec.LookPath(shell)
+		if err != nil {
+			continue
+		}
+		t.Run(shell, func(t *testing.T) {
+			ops, srv := newTestOpsOn(t, true)
+			srv.shell.Store(path)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			res, err := ops.Exec(ctx, "127.0.0.1", "u", "echo out; echo err >&2; exit 3", ExecOptions{})
+			if err != nil || res.Stdout != "out\n" || res.Stderr != "err\n" || res.ExitCode != 3 {
+				t.Fatalf("plain: %+v, %v", res, err)
+			}
+			res, err = ops.Exec(ctx, "127.0.0.1", "u", "cat; echo end", ExecOptions{Stdin: "line\n"})
+			if err != nil || res.Stdout != "line\nend\n" {
+				t.Fatalf("stdin: %+v, %v", res, err)
+			}
+			marker := filepath.Join(t.TempDir(), "survived")
+			res, err = ops.Exec(ctx, "127.0.0.1", "u", "echo started; sleep 2; touch "+ShellEscape(marker), ExecOptions{TimeoutMs: 300})
+			if err != nil || !res.TimedOut || res.Stdout != "started\n" {
+				t.Fatalf("timeout: %+v, %v", res, err)
+			}
+			time.Sleep(2500 * time.Millisecond)
+			if _, err := os.Stat(marker); err == nil {
+				t.Error("the timed-out command kept running")
+			}
+		})
 	}
 }
