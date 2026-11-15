@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,12 @@ func (c *loginCache) get(siteID int64) (string, bool) {
 	return e.user, true
 }
 
+func (c *loginCache) drop(siteID int64) {
+	c.mu.Lock()
+	delete(c.m, siteID)
+	c.mu.Unlock()
+}
+
 func (c *loginCache) put(siteID int64, user string) {
 	c.mu.Lock()
 	c.m[siteID] = loginEntry{user: user, at: time.Now()}
@@ -59,27 +66,41 @@ type siteLogin struct {
 // key wins and is cached. Several collaborators can use the same label, so
 // a refused key just moves on to the next candidate.
 func (d *Deps) resolveLogin(ctx context.Context, siteInput string) (*siteLogin, error) {
+	// The first call to a site pays for three things in a row; the debug
+	// log says how long each took.
+	started := time.Now()
 	site, err := d.Sites.Resolve(ctx, siteInput)
 	if err != nil {
 		return nil, err
 	}
+	slog.Debug("site resolved", "site", siteInput, "id", site.ID, "took", time.Since(started).Round(time.Millisecond))
 	if user, ok := d.Logins.get(site.ID); ok {
-		return &siteLogin{Site: site, User: user}, nil
+		// A remembered login can stop working (removed in MyPressable, key
+		// replaced). Connecting is free while the connection is pooled, so
+		// check, and look the login up again if the key is now refused.
+		if err := d.connect(user); err == nil || !mcsh.IsAuthError(err) {
+			return &siteLogin{Site: site, User: user}, nil
+		}
+		d.Logins.drop(site.ID)
 	}
 	if !mcsh.KeyPairExists(d.Cfg.SSHKeyPath) {
 		return nil, fmt.Errorf("SSH key not found at %s. Run `presswrench setup` to create it and add it to Pressable", d.Cfg.SSHKeyPath)
 	}
+	started = time.Now()
 	accounts, err := sites.FTPAccounts(ctx, d.Gateway, site.ID)
 	if err != nil {
 		return nil, err
 	}
+	slog.Debug("site logins listed", "id", site.ID, "logins", len(accounts), "took", time.Since(started).Round(time.Millisecond))
 	candidates := sites.KeyCandidates(accounts, d.Cfg.SSHKeyLabel, identityEmail(d.Session.Identity()))
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("No SSH-key login exists on site %s for your key. Either the public key %s.pub hasn't been added in MyPressable (Profile → Settings → SSH Keys, label %q), or your Pressable account lacks SFTP access to this site", siteLabel(site), d.Cfg.SSHKeyPath, d.Cfg.SSHKeyLabel)
 	}
 	var lastErr error
 	for _, user := range candidates {
-		_, err := d.SSHPool.Get(d.Cfg.SSHHost, user)
+		started = time.Now()
+		err := d.connect(user)
+		slog.Debug("ssh login tried", "id", site.ID, "login", user, "ok", err == nil, "took", time.Since(started).Round(time.Millisecond))
 		if err == nil {
 			d.Logins.put(site.ID, user)
 			return &siteLogin{Site: site, User: user}, nil
@@ -90,6 +111,15 @@ func (d *Deps) resolveLogin(ctx context.Context, siteInput string) (*siteLogin, 
 		lastErr = err
 	}
 	return nil, fmt.Errorf("None of the %d key-based logins on site %s accepted %s (last error: %v). Check that this key's public half is the one added in MyPressable under label %q", len(candidates), siteLabel(site), d.Cfg.SSHKeyPath, lastErr, d.Cfg.SSHKeyLabel)
+}
+
+// connect opens (or reuses) the SSH connection for a login.
+func (d *Deps) connect(user string) error {
+	if d.dial != nil {
+		return d.dial(user)
+	}
+	_, err := d.SSHPool.Get(d.Cfg.SSHHost, user)
+	return err
 }
 
 // CheckSSH resolves a site and confirms our key logs in to it. Used by the

@@ -12,6 +12,11 @@ import (
 // local policy: its name and Pressable's own behavior annotations.
 type Operation struct {
 	Name        string
+	Title       string
+	Description string
+	// InputSchema is the operation's JSON Schema for its parameters, as the
+	// gateway returned it (nil when it returned none).
+	InputSchema json.RawMessage
 	ReadOnly    bool
 	Destructive bool
 }
@@ -58,7 +63,10 @@ func (d *Describer) Describe(ctx context.Context, name string) (*Operation, erro
 
 func parseOperation(name, text string) (*Operation, error) {
 	var raw struct {
-		Name        string `json:"name"`
+		Name        string          `json:"name"`
+		Title       string          `json:"title"`
+		Description string          `json:"description"`
+		InputSchema json.RawMessage `json:"inputSchema"`
 		Annotations struct {
 			ReadOnlyHint    *bool `json:"readOnlyHint"`
 			DestructiveHint *bool `json:"destructiveHint"`
@@ -70,7 +78,7 @@ func parseOperation(name, text string) (*Operation, error) {
 	if raw.Name != "" && raw.Name != name {
 		return nil, fmt.Errorf("describe %s: gateway returned the definition of %q", name, raw.Name)
 	}
-	op := &Operation{Name: name}
+	op := &Operation{Name: name, Title: raw.Title, Description: raw.Description, InputSchema: raw.InputSchema}
 	// Absent hints are treated conservatively: not read-only, destructive.
 	if raw.Annotations.ReadOnlyHint != nil {
 		op.ReadOnly = *raw.Annotations.ReadOnlyHint

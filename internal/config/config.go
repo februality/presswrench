@@ -27,12 +27,16 @@ type Config struct {
 	KnownHostsPath string
 	SSHTimeoutMs   int
 	ExecTimeoutMs  int
+	// MaxOutputBytes caps each of a command's stdout and stderr, and a file
+	// read, in one tool result (0 = unlimited).
+	MaxOutputBytes int
 	// CacheTTLSeconds bounds how long site lookups and SFTP-user matches
 	// are reused before being re-fetched from Pressable.
 	CacheTTLSeconds int
 	InsecureHostKey bool
 
-	// ReadOnly hides pressable_ssh_exec, pressable_wp_cli and pressable_sftp_write, and restricts
+	// ReadOnly hides pressable_ssh_exec, pressable_wp_cli, pressable_sftp_write and
+	// pressable_sftp_edit, and restricts
 	// pressable_execute to operations Pressable marks read-only.
 	// Driven by PRESSWRENCH_READ_ONLY (1/true/yes/on). Off by default.
 	ReadOnly bool
@@ -50,6 +54,7 @@ const (
 	DefaultKnownHostsPath    = "~/.ssh/presswrench_known_hosts"
 	DefaultSSHTimeoutMs      = 30000
 	DefaultExecTimeoutMs     = 120000
+	DefaultMaxOutputBytes    = 60000
 	DefaultCacheTTLSec       = 300
 	DefaultBlockedOperations = "delete_site"
 )
@@ -92,6 +97,7 @@ func Load() (*Config, error) {
 		KnownHostsPath:    knownHosts,
 		SSHTimeoutMs:      intEnv("PRESSWRENCH_SSH_TIMEOUT_MS", DefaultSSHTimeoutMs),
 		ExecTimeoutMs:     intEnv("PRESSWRENCH_EXEC_TIMEOUT_MS", DefaultExecTimeoutMs),
+		MaxOutputBytes:    intEnv("PRESSWRENCH_MAX_OUTPUT_BYTES", DefaultMaxOutputBytes),
 		CacheTTLSeconds:   intEnv("PRESSWRENCH_CACHE_TTL_SECONDS", DefaultCacheTTLSec),
 		InsecureHostKey:   os.Getenv("PRESSWRENCH_INSECURE_DISABLE_HOST_KEY_CHECK") == "1",
 		ReadOnly:          IsTrueEnv(os.Getenv("PRESSWRENCH_READ_ONLY")),

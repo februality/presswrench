@@ -17,6 +17,15 @@ const (
 	cleanupInterval = 60 * time.Second
 )
 
+// A pooled connection is pinged every keepaliveInterval; no answer within
+// keepaliveTimeout closes it. Without this a connection the network dropped
+// silently (a laptop that slept, a NAT that forgot it) looks alive, and the
+// next request on it hangs instead of failing over to a fresh dial.
+const (
+	keepaliveInterval = 30 * time.Second
+	keepaliveTimeout  = 15 * time.Second
+)
+
 type poolEntry struct {
 	client   *xssh.Client
 	lastUsed time.Time
@@ -29,6 +38,9 @@ type Pool struct {
 	keyPath   string
 	timeoutMs int
 	verifier  *HostKeyVerifier
+	port      int // 22; tests point it at a local server
+	// keepalive timing; tests shorten it before the first Get.
+	pingEvery, pingWait time.Duration
 
 	mu       sync.Mutex
 	entries  map[string]*poolEntry
@@ -41,6 +53,9 @@ func NewPool(keyPath string, timeoutMs int, verifier *HostKeyVerifier) *Pool {
 		keyPath:   keyPath,
 		timeoutMs: timeoutMs,
 		verifier:  verifier,
+		port:      22,
+		pingEvery: keepaliveInterval,
+		pingWait:  keepaliveTimeout,
 		entries:   make(map[string]*poolEntry),
 		stopCh:    make(chan struct{}),
 	}
@@ -79,14 +94,17 @@ func (p *Pool) Get(host, user string) (*xssh.Client, error) {
 	p.mu.Unlock()
 
 	// Auto-remove on disconnect.
+	closed := make(chan struct{})
 	go func() {
 		_ = client.Wait()
+		close(closed)
 		p.mu.Lock()
 		if e, ok := p.entries[key]; ok && e.client == client {
 			delete(p.entries, key)
 		}
 		p.mu.Unlock()
 	}()
+	go keepalive(client, closed, p.pingEvery, p.pingWait)
 
 	return client, nil
 }
@@ -107,7 +125,7 @@ func (p *Pool) dial(host, user string) (*xssh.Client, error) {
 		HostKeyCallback: p.verifier.Callback(),
 		Timeout:         timeout,
 	}
-	addr := net.JoinHostPort(host, strconv.Itoa(22))
+	addr := net.JoinHostPort(host, strconv.Itoa(p.port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("SSH connection to %s@%s failed: %w", user, host, err)
@@ -122,6 +140,37 @@ func (p *Pool) dial(host, user string) (*xssh.Client, error) {
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return xssh.NewClient(c, chans, reqs), nil
+}
+
+// keepalive pings client every interval until it closes, and closes it when
+// a ping goes unanswered for wait.
+func keepalive(client *xssh.Client, closed <-chan struct{}, interval, wait time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-closed:
+			return
+		case <-t.C:
+		}
+		answered := make(chan error, 1)
+		go func() {
+			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+			answered <- err
+		}()
+		select {
+		case err := <-answered:
+			if err != nil {
+				_ = client.Close()
+				return
+			}
+		case <-closed:
+			return
+		case <-time.After(wait):
+			_ = client.Close()
+			return
+		}
+	}
 }
 
 // IsAuthError reports whether err is the server refusing our key — the

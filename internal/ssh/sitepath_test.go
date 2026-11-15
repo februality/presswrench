@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -18,20 +19,43 @@ func TestSFTPPath(t *testing.T) {
 		{"~/htdocs/wp-config.php", true, "/wp-config.php"},
 		{"htdocs/wp-config.php", true, "/wp-config.php"},
 		{"/wp-content/../wp-config.php", true, "/wp-config.php"},
-		{"../../etc/passwd", true, "/etc/passwd"},
-		{"/srv/htdocsx/file", true, "/srv/htdocsx/file"},
-		{"~/htdocs-backup/x", true, "/~/htdocs-backup/x"},
 		{"htdocs-old/x", true, "/htdocs-old/x"},
 		{"~/htdocs", true, "/"},
+		{"tmp/x", true, "/tmp/x"},
+		{"/srv/htdocs/tmp/x", true, "/tmp/x"},
+		{"wp-content/../wp-config.php", true, "/wp-config.php"},
 
 		{"", false, "/srv/htdocs"},
 		{"wp-content", false, "/srv/htdocs/wp-content"},
 		{"/srv/htdocs/wp-content", false, "/srv/htdocs/wp-content"},
 		{"/wp-content", false, "/srv/htdocs/wp-content"},
+		{"/tmp/dump.sql", false, "/tmp/dump.sql"},
 	}
 	for _, c := range cases {
-		if got := SFTPPath(c.in, c.chrooted); got != c.want {
-			t.Errorf("SFTPPath(%q, %v) = %q, want %q", c.in, c.chrooted, got, c.want)
+		got, err := SFTPPath(c.in, c.chrooted)
+		if err != nil || got != c.want {
+			t.Errorf("SFTPPath(%q, %v) = %q, %v; want %q", c.in, c.chrooted, got, err, c.want)
+		}
+	}
+}
+
+// A shell path outside the web root is refused, never remapped into it.
+func TestSFTPPath_OutsideRoot(t *testing.T) {
+	for _, in := range []string{"/tmp", "/tmp/dump.sql", "/home/123/x", "/etc/passwd", "/srv/htdocsx/file",
+		"/srv", "~/x", "~", "~/htdocs-backup/x", "../../etc/passwd", "wp-content/../../x", "/srv/htdocs/../../etc/passwd"} {
+		got, err := SFTPPath(in, true)
+		var out *OutsideRootError
+		if !errors.As(err, &out) {
+			t.Errorf("SFTPPath(%q) = %q, %v; want OutsideRootError", in, got, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), in) || !strings.Contains(err.Error(), "pressable_ssh_exec") {
+			t.Errorf("SFTPPath(%q) error = %q", in, err)
+		}
+	}
+	for _, in := range []string{"~/x", "../x"} {
+		if _, err := SFTPPath(in, false); err == nil {
+			t.Errorf("SFTPPath(%q, unchrooted) accepted", in)
 		}
 	}
 }
@@ -69,7 +93,10 @@ func FuzzSFTPPath(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, in string) {
-		got := SFTPPath(in, true)
+		got, err := SFTPPath(in, true)
+		if err != nil {
+			return
+		}
 		if !strings.HasPrefix(got, "/") {
 			t.Fatalf("SFTPPath(%q) = %q: not absolute", in, got)
 		}

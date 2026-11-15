@@ -135,14 +135,16 @@ Comparison as of October 2026.
 
 | Tool | What it does |
 |---|---|
-| `pressable_discover` | List the Pressable operations available to you (filter with `query`) |
+| `pressable_sites` | List the sites you can access, one line each (filter with `query`) |
+| `pressable_discover` | Find Pressable operations by words; a short result includes their parameters |
 | `pressable_describe` | Show an operation's parameters and whether Pressable marks it read-only or destructive |
-| `pressable_execute` | Run an operation as you, subject to Pressable's permissions and your local policy |
-| `pressable_ssh_exec` | Run a shell command on a site; returns full stdout, stderr and exit code |
-| `pressable_wp_cli` | Run a WP-CLI command on a site; the leading `wp` is optional |
-| `pressable_sftp_read` | Read a text file |
-| `pressable_sftp_write` | Write a text file atomically (replaces the whole file; parent folders on request) |
-| `pressable_sftp_list` | List a directory |
+| `pressable_execute` | Run an operation as you, subject to Pressable's permissions and your local policy; `site` fills in `site_id` |
+| `pressable_ssh_exec` | Run a shell command on a site; returns stdout, stderr and exit code (very long output keeps its start and end); optional `stdin` |
+| `pressable_wp_cli` | Run a WP-CLI command on a site; the leading `wp` is optional; `stdin` for `eval-file -` or `db query` |
+| `pressable_sftp_read` | Read a text file, or a range of its lines; `local_path` downloads it to your computer instead |
+| `pressable_sftp_edit` | Replace one piece of text in a file, atomically |
+| `pressable_sftp_write` | Write a whole file atomically, from text or from a local file (`local_path`); parent folders on request |
+| `pressable_sftp_list` | List a directory, one entry per line |
 | `pressable_ssh_status` | Show your local SSH key; with `site`, find and test your SSH login there |
 
 Site tools accept a site name, domain or numeric ID — exact matches only, so a typo returns a "did you mean" list instead of acting on the wrong site. Paths can be relative to the web root (`wp-content/…`) or absolute (`/srv/htdocs/…`).
@@ -173,7 +175,7 @@ A few actions are reserved for the account owner whatever the roles: one-click W
 > PressWrench is deliberately powerful. Within your Pressable permissions, your AI tool can change PHP versions, restore backups over live data, delete plugins and domains, edit any file, and run any command over SSH. Review what it's about to do before you approve it, and keep your own backups.
 
 - **`delete_site` is blocked by default**, even if your role allows it. Adjust with `presswrench install --all --blocked-operations "delete_site,delete_site_ondemand_backup"`, or `--blocked-operations none`.
-- **Read-only mode** (`setup --read-only` or `install --read-only`) removes `pressable_ssh_exec`, `pressable_wp_cli` and `pressable_sftp_write` entirely, and `pressable_execute` only runs operations Pressable itself marks read-only.
+- **Read-only mode** (`setup --read-only` or `install --read-only`) removes `pressable_ssh_exec`, `pressable_wp_cli`, `pressable_sftp_write` and `pressable_sftp_edit` entirely, and `pressable_execute` only runs operations Pressable itself marks read-only.
 - **Credentials** live in the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service), or in a `0600` file where no keychain exists. Tokens refresh automatically; `presswrench logout` revokes them.
 - **SSH uses your own key.** PressWrench never resets SFTP passwords. Pressable's host key is pinned on first connection in a separate `known_hosts` file, and a later mismatch refuses to connect.
 - **File writes are atomic**: a dropped connection leaves either the old file or the new one, never half of each.
@@ -281,6 +283,7 @@ All optional. `setup` and `install` write the relevant ones into the AI tool's c
 | `PRESSWRENCH_SSH_KEY_LABEL` | `presswrench` | The key's name in MyPressable |
 | `PRESSWRENCH_KNOWN_HOSTS_PATH` | `~/.ssh/presswrench_known_hosts` | Pinned SSH host keys |
 | `PRESSWRENCH_EXEC_TIMEOUT_MS` | `120000` | Default timeout for shell and WP-CLI commands (`timeout: 0` on a call disables it) |
+| `PRESSWRENCH_MAX_OUTPUT_BYTES` | `60000` | Cap on command output (stdout and stderr each) and on a file read in one tool result; `0` removes it |
 | `PRESSWRENCH_SSH_TIMEOUT_MS` | `30000` | SSH connection timeout |
 | `PRESSWRENCH_CACHE_TTL_SECONDS` | `300` | How long site lookups and SSH-login matches are reused |
 | `PRESSWRENCH_SSH_HOST` | `ssh.pressable.com` | SSH endpoint |
